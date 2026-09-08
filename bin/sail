@@ -608,12 +608,14 @@ if [ "$MODE" = "stream" ]; then
     RENDER_PID=$!
     case "$PLAYER" in
         iina) if [ -n "$SUB_PATH" ]; then
-                  # --mpv-sub-file is a no-go here: mpv's own --list-options
-                  # marks it "alias for --sub-files-append (CLI/config files
-                  # only)" — IINA relays --mpv-* through libmpv's option API,
-                  # not mpv's own CLI arg parser, so that CLI-only alias is
-                  # silently dropped. --sub-files-append is a real option
-                  "$IINA_CLI" --keep-running --mpv-sub-files-append="$SUB_PATH" "$STREAM_URL"
+                  # verified against IINA's own mpv IPC socket (track-list /
+                  # sid), not just guessed: --mpv-sub-file (CLI-only alias)
+                  # and --mpv-sub-files-append both get silently dropped by
+                  # IINA's option relay — the append variant never even
+                  # appears in track-list. The plain "set" form, --mpv-sub-
+                  # files (no -append), is what actually gets applied and
+                  # auto-selected (confirmed selected:true, sid:1)
+                  "$IINA_CLI" --keep-running --mpv-sub-files="$SUB_PATH" "$STREAM_URL"
               else
                   "$IINA_CLI" --keep-running "$STREAM_URL"
               fi ;;
