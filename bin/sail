@@ -9,11 +9,10 @@
 #   sail --version      print the version and exit
 #
 # SAIL_DEBUG=1 prints each source's stderr (timeouts, parse errors) after
-# a search instead of discarding it.
+# a search instead of discarding it, and why a subtitle already inside a
+# streamed torrent (if any) failed to fetch.
 #
-# SAIL_OPENSUBTITLES_KEY, if set, fetches a subtitle from OpenSubtitles
-# before streaming (SAIL_SUB_LANG picks the language, default "en").
-# A macOS notification also fires when a background download finishes.
+# A macOS notification fires when a background download finishes or fails.
 
 set -euo pipefail
 
@@ -519,16 +518,42 @@ if [ "$MODE" = "stream" ]; then
     fi
     VID_PATH="$(awk -F'\t' -v i="$VID_IDX" '$1 == i {print $3}' "$WORK/files.tsv")"
 
-    # subtitles are opt-in (needs a free OpenSubtitles API key) and best
-    # effort — kicked off now, in the background, so the lookup overlaps
-    # with the stream server starting up instead of adding its own delay
-    SUB_PATH=""
-    SUB_PID=""
-    if [ -n "${SAIL_OPENSUBTITLES_KEY:-}" ]; then
-        python3 "$LIB_DIR/subs.py" "$VID_PATH" "$WORK/sub.srt" \
-            --lang "${SAIL_SUB_LANG:-en}" >"$WORK/sub.path" 2>"$WORK/subs.err" &
-        SUB_PID=$!
+    # look for a subtitle already inside this torrent that matches the
+    # picked video — free, no rate limit, and guaranteed to be timed for
+    # this exact release, unlike an external subtitle API. Exact filename
+    # match beats "same stem plus a language suffix" beats "just in the
+    # same folder"; anything scoring 0 (no candidate at all) is skipped
+    # rather than guessing and attaching the wrong episode's subtitle
+    SUB_MATCH="$(awk -F'\t' -v vidpath="$VID_PATH" '
+        BEGIN {
+            dir = vidpath; sub(/[^\/]*$/, "", dir); dir = tolower(dir)
+            base = vidpath; sub(/.*\//, "", base)
+            stem = base; sub(/\.[^.]*$/, "", stem); stem = tolower(stem)
+        }
+        {
+            path = $3; lc = tolower(path)
+            if (lc !~ /\.(srt|ass|ssa|vtt)$/) next
+            cbase = path; sub(/.*\//, "", cbase)
+            cstem = cbase; sub(/\.[^.]*$/, "", cstem); cstem = tolower(cstem)
+            cdir = path; sub(/[^\/]*$/, "", cdir); cdir = tolower(cdir)
+            score = 0
+            if (cstem == stem) score = 3
+            else if (index(cstem, stem) == 1) score = 2
+            else if (cdir == dir) score = 1
+            if (score == 0) next
+            bonus = (cstem ~ /(^|[._-])(en|eng|english)([._-]|$)/) ? 1 : 0
+            total = score * 10 + bonus
+            if (total > best) { best = total; bi = $1; bp = path }
+        }
+        END { if (bi != "") printf "%s\t%s\n", bi, bp }
+    ' "$WORK/files.tsv")"
+    SUB_IDX="" SUB_TORRENT_PATH="" SUB_PATH=""
+    if [ -n "$SUB_MATCH" ]; then
+        SUB_IDX="${SUB_MATCH%%$'\t'*}"
+        SUB_TORRENT_PATH="${SUB_MATCH#*$'\t'}"
     fi
+    SERVE_SEL="$VID_IDX"
+    [ -n "$SUB_IDX" ] && SERVE_SEL="$VID_IDX,$SUB_IDX"
 
     # run a quiet wt.js stream server and launch the player ourselves:
     # webtorrent's own --iina opens IINA via URL scheme, which doesn't give
@@ -538,7 +563,7 @@ if [ "$MODE" = "stream" ]; then
     INFOHASH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["infoHash"])' "$WORK/info.json")"
     URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$VID_PATH")"
     node "$LIB_DIR/wt.js" "$WTMOD" serve "$META" "$WORK/stream" \
-        "$VID_IDX" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
+        "$SERVE_SEL" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
     WT_PID=$!
     STREAMING=1
     # the runner prints PORT=<n> once listening (falls back to any free port
@@ -557,14 +582,21 @@ if [ "$MODE" = "stream" ]; then
     fi
     STREAM_URL="http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$URLPATH"
 
-    if [ -n "$SUB_PID" ]; then
-        wait "$SUB_PID" 2>/dev/null || true
-        if [ -s "$WORK/sub.path" ]; then
-            SUB_PATH="$(cat "$WORK/sub.path")"
-            printf '  %ssubtitles: %s%s\n' "$DIM" "$(basename "$SUB_PATH")" "$RST"
-        elif [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/subs.err" ]; then
-            printf '  %ssubtitles:%s\n' "$DIM" "$RST" >&2
-            sed 's/^/    /' "$WORK/subs.err" >&2
+    # the subtitle is served the same way as the video — pull it from our
+    # own stream server (which pulls it from the swarm, prioritized by the
+    # select() call in wt.js) rather than an external service. It's tiny,
+    # so this is normally near-instant; capped so a slow swarm can never
+    # hold up playback for long
+    if [ -n "$SUB_IDX" ]; then
+        SUB_URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$SUB_TORRENT_PATH")"
+        SUB_EXT="${SUB_TORRENT_PATH##*.}"
+        if curl -fsS -m 8 -o "$WORK/sub.$SUB_EXT" \
+                "http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$SUB_URLPATH" 2>"$WORK/subs.err"; then
+            SUB_PATH="$WORK/sub.$SUB_EXT"
+            printf '  %ssubtitles: %s%s\n' "$DIM" "$(basename "$SUB_TORRENT_PATH")" "$RST"
+        elif [ "${SAIL_DEBUG:-0}" = 1 ]; then
+            printf '  %ssubtitles: failed to fetch %s%s\n' "$DIM" "$SUB_TORRENT_PATH" "$RST" >&2
+            [ -s "$WORK/subs.err" ] && sed 's/^/    /' "$WORK/subs.err" >&2
         fi
     fi
 
