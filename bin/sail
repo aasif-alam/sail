@@ -57,10 +57,13 @@ SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
 LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
 WORK="$(mktemp -d -t sail.XXXXXX)"
 # clean temp files on every exit path — including Ctrl+C and closed windows.
-# WT_PID goes through stop_pid (SIGTERM, then SIGKILL if it doesn't die) —
-# a plain kill can leave an orphaned webtorrent process running in the
-# background when destroy() hangs, per the comment above stop_pid
-trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
+# WT_PID and WPID both go through stop_pid (SIGTERM, then SIGKILL if they
+# don't die) — a plain kill, or no kill at all, can leave an orphaned
+# webtorrent process running in the background (holding ports that then
+# break the NEXT run with "address already in use") when destroy() hangs,
+# per the comment above stop_pid — WPID is the metadata-fetch process
+# started in read_meta below, which runs well before WT_PID exists
+trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
 # before this behavior existed (nothing writes here anymore, so after the
