@@ -592,11 +592,17 @@ if [ "$MODE" = "stream" ]; then
     # hold up playback for long
     if [ -n "$SUB_IDX" ]; then
         SUB_URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$SUB_TORRENT_PATH")"
-        SUB_EXT="${SUB_TORRENT_PATH##*.}"
-        if curl -fsS -m 8 -o "$WORK/sub.$SUB_EXT" \
+        # keep the original torrent filename locally too — a generic name
+        # like "sub.srt" is what IINA's subtitle picker would then show,
+        # which is indistinguishable from an unrelated or empty file at a
+        # glance; the real name makes it obviously the right one
+        SUB_BASENAME="$(basename "$SUB_TORRENT_PATH")"
+        if curl -fsS -m 8 -o "$WORK/$SUB_BASENAME" \
                 "http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$SUB_URLPATH" 2>"$WORK/subs.err"; then
-            SUB_PATH="$WORK/sub.$SUB_EXT"
-            printf '  %ssubtitles: %s%s\n' "$DIM" "$(basename "$SUB_TORRENT_PATH")" "$RST"
+            SUB_PATH="$WORK/$SUB_BASENAME"
+            printf '  %ssubtitles: %s%s\n' "$DIM" "$SUB_BASENAME" "$RST"
+            [ "${SAIL_DEBUG:-0}" = 1 ] && printf '  %s(saved to %s, %s bytes)%s\n' \
+                "$DIM" "$SUB_PATH" "$(wc -c < "$SUB_PATH" | tr -d ' ')" "$RST" >&2
         elif [ "${SAIL_DEBUG:-0}" = 1 ]; then
             printf '  %ssubtitles: failed to fetch %s%s\n' "$DIM" "$SUB_TORRENT_PATH" "$RST" >&2
             [ -s "$WORK/subs.err" ] && sed 's/^/    /' "$WORK/subs.err" >&2
