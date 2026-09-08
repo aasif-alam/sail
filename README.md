@@ -1,0 +1,85 @@
+# sail
+
+Search, stream, and download torrents entirely from the macOS terminal.
+
+## Usage
+
+| Command | Behavior |
+|---|---|
+| `sail <query>` | pick a result, then choose stream/download |
+| `sail -s <query>` | stream the picked result immediately |
+| `sail -d <query>` | download the picked result immediately |
+| `sail sources` | choose which sources every search uses |
+
+Downloads go to `~/Downloads/torrents` (override with `TORRENT_DOWNLOAD_DIR`).
+
+When streaming a torrent with more than one video file (season packs,
+movies with extras), sail shows a picker so you choose exactly which one
+plays — only that file is downloaded, never the whole torrent. A single
+video file plays immediately with no picker.
+
+Streaming uses IINA, mpv, or VLC, whichever is found first (in that order).
+While a stream plays, the terminal shows a live line of peers, download
+speed, and progress for the file — quit the player to stop.
+
+Nothing is cached: torrent metadata is fetched fresh on every stream, the
+downloaded video lives in a temp directory that's wiped the moment you quit
+the player, and any leftover data from a previous version of sail is
+removed on startup.
+
+Downloading (`sail -d`) uses the same picker: a season pack with several
+video files lets you pick exactly which ones to save — tab toggles, ctrl-a
+selects all, ctrl-d clears — and only the files you picked are written to
+disk. A live progress line tracks the download the same way streaming does.
+
+## Sources
+
+Nine sources are built in. Pick and choose the ones every search uses:
+
+```
+sail sources
+```
+
+This opens a tick-list (tab toggles, enter saves). Your selection is stored in
+`~/.config/sail/sources.conf` — one source name per line — and applies
+globally. You can also edit that file by hand.
+
+| Source | Focus | Method |
+|---|---|---|
+| `tpb` | general | JSON API |
+| `yts` | movies | JSON API |
+| `eztv` | TV episodes | JSON API |
+| `knaben` | aggregator, well seeded | HTML scrape |
+| `tcsv` | DHT crawled, open data | JSON API |
+| `solid` | general | JSON API |
+| `nyaa` | anime / Asian media | HTML scrape |
+| `1337x` | general | HTML scrape |
+| `torlock` | general, verified | HTML scrape |
+| `tgx` | general | HTML scrape |
+| `lime` | general | HTML scrape |
+
+With no config file, searches use `tpb`, `yts`, `eztv`, `knaben`, `tcsv`, and
+`solid`.
+Scraped sources depend on site layout and can break when sites change;
+a failing source never blocks the others.
+
+## Install
+
+```bash
+cd sail
+./install.sh
+```
+
+The installer sets up everything via Homebrew: `fzf`, `webtorrent-cli`, the IINA
+player, and the `sail` command itself.
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+## Notes
+
+- Streaming needs a reasonably well-seeded torrent; rare files will stutter.
+- Only download content you are legally permitted to obtain.

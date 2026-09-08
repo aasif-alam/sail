@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# sail — search, stream, and download torrents from the terminal.
+#
+# Usage:
+#   sail <query>        pick a result, then stream or download
+#   sail -d <query>     download straight to ~/Downloads
+#   sail -s <query>     stream in your media player
+#   sail sources        choose which sources to search
+
+set -euo pipefail
+
+# ---------- palette (plain when not attached to a terminal) ----------------
+if [ -t 1 ]; then
+    BLD=$'\e[1m'; DIM=$'\e[2m'
+    RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+else
+    BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
+fi
+
+DOWNLOAD_DIR="${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}"
+
+# SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
+# for a very long time on unreachable trackers
+stop_pid() {
+    local p="$1" k
+    kill "$p" 2>/dev/null || return 0
+    for k in $(seq 1 10); do
+        kill -0 "$p" 2>/dev/null || return 0
+        sleep 0.5
+    done
+    kill -9 "$p" 2>/dev/null || true
+}
+
+usage() {
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
+WORK="$(mktemp -d -t sail.XXXXXX)"
+# clean temp files on every exit path — including Ctrl+C and closed windows
+trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && kill "$WT_PID" 2>/dev/null || true; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf /tmp/webtorrent; fi' EXIT INT TERM
+
+# no torrent data persists between runs — wipe any leftover cache from
+# before this behavior existed (nothing writes here anymore, so after the
+# first launch this is a no-op)
+rm -rf "$HOME/.cache/sail"
+
+# ---- grow the terminal window so results fit (never shrink) ---------------
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    WANT_C=140; WANT_R=42
+    CUR_C=$(tput cols 2>/dev/null || echo 0)
+    CUR_R=$(tput lines 2>/dev/null || echo 0)
+    if [ "${CUR_C:-0}" -lt "$WANT_C" ] || [ "${CUR_R:-0}" -lt "$WANT_R" ]; then
+        NEW_C=$(( CUR_C > WANT_C ? CUR_C : WANT_C ))
+        NEW_R=$(( CUR_R > WANT_R ? CUR_R : WANT_R ))
+        printf '\e[8;%d;%dt' "$NEW_R" "$NEW_C"
+        sleep 0.15
+    fi
+fi
+
+# ---- `sail sources` — choose which sources every search uses --------------
+if [ "${1:-}" = "sources" ]; then
+    CONF="${SAIL_SOURCES:-$HOME/.config/sail/sources.conf}"
+    mkdir -p "$(dirname "$CONF")"
+
+    python3 "$LIB_DIR/search.py" --list-sources > "$WORK/results"
+
+    NAMES=(); DESCS=(); ON=()
+    while IFS=$'\t' read -r name desc; do
+        NAMES+=("$name"); DESCS+=("$desc")
+        if [ -f "$CONF" ] && grep -qx "$name" "$CONF"; then ON+=(1); else ON+=(0); fi
+    done < "$WORK/results"
+
+    DIRTY=0
+    draw() {
+        printf '\033[H\033[2J'
+        printf '%ssources%s — used by every search\n\n' "$BLD" "$RST"
+        printf '  %s#  %-10s %-32s status%s\n' "$DIM" "" "" "$RST"
+        local i
+        for i in "${!NAMES[@]}"; do
+            if [ "${ON[$i]}" = 1 ]; then
+                printf '  %s%-2s %-10s %-32s %son%s\n' \
+                    "$DIM" "$((i + 1))" "${NAMES[$i]}" "${DESCS[$i]}" "$GRN" "$RST"
+            else
+                printf '  %s%-2s %-10s %-32s %soff%s\n' \
+                    "$DIM" "$((i + 1))" "${NAMES[$i]}" "${DESCS[$i]}" "$DIM" "$RST"
+            fi
+        done
+        printf '\n  toggle: type a number (e.g. %s1 3%s)   %sa%s all on   %sx%s all off\n' \
+            "$BLD" "$RST" "$BLD" "$RST" "$BLD" "$RST"
+        printf '  %ss%s save & exit   %sq%s quit without saving\n' "$BLD" "$RST" "$BLD" "$RST"
+        printf '\n  > '
+    }
+
+    toggle() {
+        local n="$1" i
+        case "$n" in
+            ''|*[!0-9]*) return ;;
+        esac
+        i=$((n - 1))
+        if [ "$i" -ge 0 ] && [ "$i" -lt "${#NAMES[@]}" ]; then
+            if [ "${ON[$i]}" = 1 ]; then ON[$i]=0; else ON[$i]=1; fi
+            DIRTY=1
+        fi
+    }
+
+    while draw && read -r -a tokens; do
+        case "${tokens[0]:-}" in
+            s|S)
+                if [ "$DIRTY" = 1 ]; then
+                    : > "$CONF"
+                    for i in "${!NAMES[@]}"; do
+                        if [ "${ON[$i]}" = 1 ]; then
+                            printf '%s\n' "${NAMES[$i]}" >> "$CONF"
+                        fi
+                    done
+                    printf '  saved %s%s%s\n' "$BLD" "$CONF" "$RST"
+                else
+                    printf '  nothing changed\n'
+                fi
+                exit 0
+                ;;
+            q|Q) printf '  (not saved)\n'; exit 0 ;;
+            a|A) for i in "${!NAMES[@]}"; do ON[$i]=1; done; DIRTY=1 ;;
+            x|X) for i in "${!NAMES[@]}"; do ON[$i]=0; done; DIRTY=1 ;;
+            *)   for n in "${tokens[@]+"${tokens[@]}"}"; do toggle "$n"; done ;;
+        esac
+    done
+    exit 0
+fi
+
+MODE="ask"
+while getopts "sdh" opt; do
+    case "$opt" in
+        s) MODE="stream" ;;
+        d) MODE="download" ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+
+QUERY="$*"
+
+# ---- 1. search ------------------------------------------------------------
+printf '  searching for %s%s%s ' "$CYN" "$QUERY" "$RST"
+python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>/dev/null &
+SEARCH_PID=$!
+DOTS=('   ' '.  ' '.. ' '...')
+i=0
+while kill -0 "$SEARCH_PID" 2>/dev/null; do
+    printf '%s%s%s\b\b\b' "$DIM" "${DOTS[$((i % 4))]}" "$RST"
+    i=$((i + 1))
+    sleep 0.25
+done
+wait "$SEARCH_PID" || true
+printf '%s   %s' "$DIM" "$RST"
+printf '\r%*s\r' 80 ''
+
+if [ ! -s "$WORK/results" ]; then
+    printf '  no results for %s%s%s\n' "$BLD" "$QUERY" "$RST"
+    exit 1
+fi
+
+N_RESULTS=$(wc -l < "$WORK/results" | tr -d ' ')
+printf '  %s results\n\n' "$N_RESULTS"
+
+# ---- 2. pick a torrent ------------------------------------------------------
+LINE="$(awk -F'\t' -v R="$RST" -v D="$DIM" \
+    -v G="$GRN" -v Y="$YLW" -v Rd="$RED" -v C="$CYN" -v B="$BLD" '{
+    id=$1; seed=$2+0; size=$3; src=$4; title=$5; age=$6
+    if (seed >= 50)      sc = G
+    else if (seed >= 10) sc = Y
+    else                 sc = Rd
+    printf "%s%-4s%s %s%-5s%s %-9s %-6s %s%s%s", \
+        D, id, R, sc, seed, R, size, src, B, title, R
+    if (age != "?") printf "  %s(%s)%s", D, age, R
+    printf "\n"
+}' "$WORK/results" | fzf --ansi \
+      --header="  seeders  size      source  title          enter: select   esc: cancel" \
+      --header-first --reverse --height=90% --tabstop=1 \
+      --border=rounded --margin=1,2)"
+
+[ -n "$LINE" ] || exit 0
+
+PLAIN="$(printf '%s' "$LINE" | sed $'s/\x1b\\[[0-9;]*m//g')"
+SEL_ID="${PLAIN%% *}"
+SEL_TITLE="$(awk -F'\t' -v id="$SEL_ID" '$1 == id { print $5; exit }' "$WORK/results")"
+MAGNET="$(awk -F'\t' -v id="$SEL_ID" '$1 == id { print $7; exit }' "$WORK/results")"
+
+if [[ "$MAGNET" == FETCH:* ]]; then
+    printf '  resolving magnet link…\n'
+    MAGNET="$(python3 -c "import sys; sys.path.insert(0,'$LIB_DIR'); \
+        from search import magnet_from_detail; print(magnet_from_detail('${MAGNET#FETCH:}'))")"
+fi
+
+# options for the wt.js torrent runner: the magnet's trackers (the cached
+# .torrent only carries the source site's announce list — often udp-only —
+# while the magnet includes the websocket trackers that actually reach
+# peers) plus free ports for the torrent and dht sockets
+OPTS_JSON="$(printf '%s' "$MAGNET" | tr '&' '\n' | sed -n 's/^tr=//p' | python3 -c '
+import sys, urllib.parse, json, socket
+announce = [urllib.parse.unquote(x.strip()) for x in sys.stdin if x.strip()]
+ports = []
+for _ in range(3):
+    s = socket.socket(); s.bind(("", 0)); ports.append(s.getsockname()[1]); s.close()
+print(json.dumps({"announce": announce, "torrentPort": ports[0], "dhtPort": ports[1], "serverPort": ports[2]}))')"
+
+# locate the webtorrent node module — wt.js drives it directly because
+# webtorrent-cli's --select downloads the whole torrent (broken so).
+# SAIL_WTMOD overrides; the default walks up from the webtorrent binary
+WTMOD="${SAIL_WTMOD:-}"
+if [ -z "$WTMOD" ]; then
+    WT_REAL="$(readlink -f "$(command -v webtorrent)" 2>/dev/null || true)"
+    if [ -n "$WT_REAL" ]; then
+        d="$(dirname "$WT_REAL")"
+        while [ "$d" != "/" ] && [ "$d" != "." ]; do
+            if [ -f "$d/node_modules/webtorrent/index.js" ]; then
+                WTMOD="$d/node_modules/webtorrent"
+                break
+            fi
+            d="$(dirname "$d")"
+        done
+    fi
+fi
+
+# ---- 3. stream or download ------------------------------------------------
+if [ "$MODE" = "ask" ]; then
+    printf '\n  %s%s%s\n' "$BLD" "$SEL_TITLE" "$RST"
+    printf '  stream or download? [S/d/q] '
+    read -r answer
+    case "$answer" in
+        d|D) MODE="download"; ASK_DIR=1 ;;
+        q|Q) exit 0 ;;
+        *)   MODE="stream" ;;
+    esac
+fi
+
+if [ "$MODE" = "download" ] && [ "${ASK_DIR:-0}" = 1 ]; then
+    mkdir -p "$DOWNLOAD_DIR"
+    printf '  choose a folder in the picker (cancel = %s%s%s)\n' \
+        "$CYN" "$DOWNLOAD_DIR" "$RST"
+    PICKED="$(osascript -e "POSIX path of (choose folder with prompt \"Download folder:\" default location POSIX file \"$DOWNLOAD_DIR\")" 2>/dev/null || true)"
+    if [ -n "$PICKED" ]; then
+        DOWNLOAD_DIR="${PICKED%/}"
+    fi
+fi
+
+mkdir -p "$DOWNLOAD_DIR"
+
+# ---- shared: read the torrent's file list, whichever mode we're in --------
+# metadata is fetched fresh every time — nothing is cached to disk. NOTE:
+# downloadmeta must NOT run with --quiet — quiet skips registering its
+# metadata listener, so it would never write the file
+META=""
+
+read_meta() {  # $1 = .torrent file -> info.json + files.tsv; 0 if valid
+    webtorrent info "$1" > "$WORK/info.json" 2>/dev/null \
+        && [ -s "$WORK/info.json" ] \
+        && python3 - "$WORK/info.json" > "$WORK/files.tsv" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+files = d.get("files") or [{"path": d.get("name", "file"), "length": d.get("length", 0)}]
+def h(n):
+    n = float(n)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f}{u}"
+        n /= 1024
+    return f"{n:.1f}PB"
+for i, f in enumerate(files):
+    print(f"{i}\t{h(f['length'])}\t{f['path']}")
+PY
+}
+
+printf '  reading torrent info %s' "$DIM"
+for META_TRY in 1 2; do
+    webtorrent downloadmeta "$MAGNET" --out "$WORK" 2>/dev/null &
+    WPID=$!
+    i=0
+    while kill -0 "$WPID" 2>/dev/null; do
+        [ "$i" -ge "${SAIL_META_WAIT:-300}" ] && break
+        printf '%s\b\b\b' "${DOTS[$((i % 4))]}"
+        i=$((i + 1)); sleep 0.5
+    done
+    stop_pid "$WPID"
+    printf '%s\r%*s\r' "$RST" 80 ''
+    META="$(find "$WORK" -maxdepth 1 -name '*.torrent' -print -quit)"
+    if [ -n "$META" ] && read_meta "$META"; then
+        break
+    fi
+    META=""
+    if [ "$META_TRY" != 2 ]; then
+        printf '  %sno peers yet — retrying %s' "$DIM" "$DIM"
+    fi
+done
+printf '\n'
+
+VIDS=""
+if [ -s "$WORK/files.tsv" ]; then
+    VIDS="$(awk -F'\t' 'tolower($3) ~ /\.(mkv|mp4|avi|mov|webm|m4v|mpg|mpeg|wmv|flv|ts|m2ts|vob)$/' "$WORK/files.tsv")"
+fi
+N_VIDS="$(printf '%s\n' "$VIDS" | { grep -c . || true; })"
+
+# pick_video "$VIDS"        -> single-select (stream mode)
+# pick_video "$VIDS" multi  -> multi-select, tab toggles, ctrl-a/ctrl-d
+pick_video() {
+    # a plain string, not an array: bash 3.2 (macOS's stock /bin/bash) throws
+    # "unbound variable" under `set -u` when expanding an empty array with
+    # "${arr[@]}" — an empty scalar string has no such problem
+    local sorted common_dir fzf_extra="" header="  size       ep      file"
+    if [ "${2:-}" = "multi" ]; then
+        fzf_extra="--multi --bind ctrl-a:select-all,ctrl-d:deselect-all"
+        header="$header"$'\n\n'"  tab toggles · ctrl-a all · ctrl-d none · enter confirms"
+    fi
+    # sort by path, not raw torrent-file index: scene releases zero-pad
+    # episode numbers (S01E01, S01E10, ...), so alphabetical order is
+    # already the right watch order — the torrent's own file order isn't
+    sorted="$(printf '%s\n' "$1" | sort -t "$(printf '\t')" -k3)"
+    # if every file lives in the same folder (any season pack), show it
+    # once above the list instead of repeating it on every row
+    common_dir="$(printf '%s\n' "$sorted" | awk -F'\t' '{ d=$3; sub(/[^\/]*$/, "", d); print d }' | sort -u)"
+    if [ "$(printf '%s\n' "$common_dir" | grep -c .)" -ne 1 ]; then
+        common_dir=""
+    fi
+    # >&2, not stdout: the caller captures this function's stdout as the
+    # picked line(s) via $(...) — anything else printed to stdout here would
+    # get parsed as a bogus extra "selection"
+    [ -n "$common_dir" ] && printf '  %sin %s%s\n\n' "$DIM" "$common_dir" "$RST" >&2
+    printf '%s\n' "$sorted" | awk -F'\t' -v D="$DIM" -v B="$BLD" -v R="$RST" \
+        -v G="$GRN" -v Y="$YLW" -v Rd="$RED" -v CD="$common_dir" '
+        function tobytes(s,   n, u) {
+            u = substr(s, length(s) - 1, 2)
+            if (u == "KB") return (substr(s, 1, length(s) - 2) + 0) * 1024
+            if (u == "MB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 2
+            if (u == "GB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 3
+            if (u == "TB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 4
+            return (substr(s, 1, length(s) - 1) + 0)
+        }
+        {
+            bytes = tobytes($2)
+            if (bytes >= 150 * 1024 ^ 2)      sc = G
+            else if (bytes >= 20 * 1024 ^ 2)  sc = Y
+            else                              sc = Rd
+
+            n = split($3, parts, "/")
+            fname = parts[n]
+            dir = ""
+            if (CD == "") for (k = 1; k < n; k++) dir = dir parts[k] "/"
+
+            # pull the episode tag (S01E07, s1e7, ...) out of the path so
+            # it reads as its own glanceable column instead of forcing a
+            # scan through an otherwise-identical release-name filename
+            tag = ""
+            if (match($3, /[Ss][0-9][0-9]?[Ee][0-9][0-9]?[0-9]?/))
+                tag = toupper(substr($3, RSTART, RLENGTH))
+
+            sizecol = sprintf("%s%-9s%s", sc, $2, R)
+            if (tag != "") {
+                tagcol  = sprintf("%s%-7s%s", B, tag, R)
+                pathcol = sprintf("%s%s%s%s", D, dir, fname, R)
+            } else {
+                tagcol  = sprintf("%-7s", "")
+                pathcol = sprintf("%s%s%s%s%s%s", D, dir, R, B, fname, R)
+            }
+            printf "%s\t%s\t%s\t%s\n", $1, sizecol, tagcol, pathcol
+        }' \
+    | fzf --ansi --reverse --height=80% --border=rounded --margin=1,2 \
+          --delimiter='\t' --with-nth=2,3,4 $fzf_extra \
+          --header="$header" \
+          --header-first
+}
+
+# live torrent stats while streaming or downloading — wt.js emits one
+# tab-separated STATUS line per second to wt.log; redraw a single terminal
+# line in place from the latest one. Runs as a background job (RENDER_PID);
+# the EXIT trap kills it and clears the line
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+render_status() {
+    local i=0 line peers pct down total speed filled empty bar pc k chunk
+    while :; do
+        line="$(tail -n 1 "$WORK/wt.log" 2>/dev/null || true)"
+        case "$line" in
+            STATUS*)
+                IFS=$'\t' read -r _ peers pct down total speed <<< "$line"
+                peers="${peers:-0}"; pct="${pct:-0}"
+                filled=$(( pct * 22 / 100 )); empty=$(( 22 - filled ))
+                # built char-by-char in bash, not via `tr`: `tr` mangles
+                # multi-byte UTF-8 under the C locale (the common default
+                # when a shell has no LANG/LC_ALL set), turning the block
+                # characters into invalid byte garbage
+                chunk=""
+                for ((k = 0; k < filled; k++)); do chunk+="█"; done
+                bar="${GRN}${chunk}"
+                chunk=""
+                for ((k = 0; k < empty; k++)); do chunk+="░"; done
+                bar+="${DIM}${chunk}${RST}"
+                if [ "$peers" -eq 0 ]; then pc="$RED"
+                elif [ "$peers" -lt 5 ]; then pc="$YLW"
+                else pc="$GRN"; fi
+                printf '\r  %s%s%s  %s  %s%3s%%%s   %s%2s%s peers   %s%-9s%s   %s%s/%s%s\033[K' \
+                    "$CYN" "${SPIN[$((i % 10))]}" "$RST" "$bar" \
+                    "$BLD" "$pct" "$RST" "$pc" "$peers" "$RST" \
+                    "$YLW" "$speed" "$RST" "$DIM" "$down" "$total" "$RST"
+                i=$((i + 1))
+                ;;
+        esac
+        sleep 0.5
+    done
+}
+
+if [ "$MODE" = "stream" ]; then
+    PLAYER=""
+    IINA_CLI=""
+    if [ -x /Applications/IINA.app/Contents/MacOS/iina-cli ] || command -v iina-cli >/dev/null 2>&1; then
+        PLAYER="iina"
+        IINA_CLI="$(command -v iina-cli || echo /Applications/IINA.app/Contents/MacOS/iina-cli)"
+    elif command -v mpv >/dev/null 2>&1; then
+        PLAYER="mpv"
+    elif command -v vlc >/dev/null 2>&1; then
+        PLAYER="vlc"
+    else
+        printf '  no supported player found (iina / mpv / vlc)\n' >&2
+        exit 1
+    fi
+
+    FALLBACK_STREAM() {
+        printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
+        STREAMING=1
+        webtorrent "$MAGNET" "--$PLAYER" -i
+        exit $?
+    }
+
+    # wait for the webtorrent http server and find its real port: the
+    # process also opens a bittorrent wire socket that accepts connections
+    # without ever speaking http, so probe each listening port with a
+    # request for /webtorrent/favicon.ico (answers 404 as soon as the
+    # server is up — no data needed)
+    wait_stream_port() {
+        local pid="$1" i p code ports
+        for i in $(seq 1 30); do
+            ports="$(lsof -nP -p "$pid" -a -iTCP -sTCP:LISTEN 2>/dev/null \
+                | awk '/LISTEN/{gsub(".*:", "", $9); print $9}' | sort -u)"
+            for p in $ports; do
+                code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' \
+                    "http://127.0.0.1:$p/webtorrent/favicon.ico" 2>/dev/null || true)"
+                if [ "$code" != "000" ] && [ -n "$code" ]; then
+                    printf '%s' "$p"
+                    return 0
+                fi
+            done
+            sleep 0.5
+        done
+        return 1
+    }
+
+    # can't read the torrent's file list, no video files found, or no
+    # selective-download runner — fall back to webtorrent's own picker
+    if [ ! -s "$WORK/files.tsv" ] || [ "$N_VIDS" -eq 0 ] || [ -z "$WTMOD" ]; then
+        FALLBACK_STREAM "couldn't read the file list — falling back to webtorrent's picker"
+    fi
+
+    if [ "$N_VIDS" -eq 1 ]; then
+        VID_IDX="$(printf '%s' "$VIDS" | cut -f1)"
+    else
+        printf '  %smultiple video files — pick one%s\n\n' "$BLD" "$RST"
+        PICKED="$(pick_video "$VIDS")"
+        [ -n "$PICKED" ] || exit 0
+        VID_IDX="$(printf '%s\n' "$PICKED" | sed $'s/\x1b\\[[0-9;]*m//g' | grep -E '^[0-9]+\t' | cut -f1 | tr -d ' ')"
+    fi
+    VID_PATH="$(awk -F'\t' -v i="$VID_IDX" '$1 == i {print $3}' "$WORK/files.tsv")"
+
+    # run a quiet wt.js stream server and launch the player ourselves:
+    # webtorrent's own --iina opens IINA via URL scheme, which doesn't give
+    # us a way to know when playback ends (needed to clean up the temp dir),
+    # so we drive both the server and the player directly for one
+    # consistent, controllable launch path
+    INFOHASH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["infoHash"])' "$WORK/info.json")"
+    URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$VID_PATH")"
+    node "$LIB_DIR/wt.js" "$WTMOD" serve "$META" "$WORK/stream" \
+        "$VID_IDX" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
+    WT_PID=$!
+    STREAMING=1
+    # the runner prints PORT=<n> once listening (falls back to any free port
+    # if our requested one was taken); verify it actually serves http
+    for i in $(seq 1 40); do
+        PORT="$(sed -n 's/^PORT=//p' "$WORK/wt.log" 2>/dev/null | head -1)"
+        [ -n "$PORT" ] && break
+        kill -0 "$WT_PID" 2>/dev/null || break
+        sleep 0.25
+    done
+    if [ -z "$PORT" ]; then
+        PORT="$(wait_stream_port "$WT_PID" || true)"
+    fi
+    if [ -z "$PORT" ]; then
+        FALLBACK_STREAM "stream server didn't start ($(tail -2 "$WORK/wt.log" 2>/dev/null | tr '\n' ' ')) — falling back to webtorrent's picker"
+    fi
+    STREAM_URL="http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$URLPATH"
+
+    printf '  streaming — quit the player to stop\n\n'
+    render_status &
+    RENDER_PID=$!
+    case "$PLAYER" in
+        iina) "$IINA_CLI" --keep-running "$STREAM_URL" ;;
+        mpv)  mpv "$STREAM_URL" ;;
+        vlc)  vlc "$STREAM_URL" ;;
+    esac
+    # player closed — the EXIT trap kills the webtorrent server and wipes
+    # $WORK (including the streamed video)
+    exit $?
+
+else
+    FALLBACK_DOWNLOAD() {
+        printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
+        STREAMING=1
+        exec webtorrent "$MAGNET" --out "$DOWNLOAD_DIR" -i
+    }
+
+    # can't read the torrent's file list, no video files found, or no
+    # selective-download runner — fall back to webtorrent's own downloader
+    # (this downloads the whole torrent; it's the only option without a
+    # file list to choose from)
+    if [ ! -s "$WORK/files.tsv" ] || [ "$N_VIDS" -eq 0 ] || [ -z "$WTMOD" ]; then
+        FALLBACK_DOWNLOAD "couldn't read the file list — downloading the whole torrent"
+    fi
+
+    if [ "$N_VIDS" -eq 1 ]; then
+        SEL_IDXS="$(printf '%s' "$VIDS" | cut -f1)"
+    else
+        printf '  %spick episodes to download%s\n\n' "$BLD" "$RST"
+        PICKED="$(pick_video "$VIDS" multi)"
+        [ -n "$PICKED" ] || exit 0
+        SEL_IDXS="$(printf '%s\n' "$PICKED" | sed $'s/\x1b\\[[0-9;]*m//g' | grep -E '^[0-9]+\t' | cut -f1 | tr -d ' ' | paste -sd, -)"
+    fi
+    N_SEL=$(( $(printf '%s' "$SEL_IDXS" | tr -cd ',' | wc -c) + 1 ))
+
+    printf '  downloading %s%d file%s%s to %s%s%s\n\n' \
+        "$BLD" "$N_SEL" "$([ "$N_SEL" = 1 ] || printf s)" "$RST" "$CYN" "$DOWNLOAD_DIR" "$RST"
+    node "$LIB_DIR/wt.js" "$WTMOD" get "$META" "$DOWNLOAD_DIR" \
+        "$SEL_IDXS" "$OPTS_JSON" >"$WORK/wt.log" 2>&1 &
+    WT_PID=$!
+    STREAMING=1
+    render_status &
+    RENDER_PID=$!
+    WT_STATUS=0
+    wait "$WT_PID" || WT_STATUS=$?
+    kill "$RENDER_PID" 2>/dev/null || true
+    printf '\r%*s\r' 80 ''
+    if [ "$WT_STATUS" -eq 0 ]; then
+        printf '  %sdone%s — saved to %s%s%s\n' "$GRN" "$RST" "$CYN" "$DOWNLOAD_DIR" "$RST"
+    else
+        printf '  %sdownload didn'"'"'t finish cleanly (%s)%s\n' "$RED" "$WT_STATUS" "$RST"
+    fi
+fi
