@@ -13,8 +13,10 @@ import concurrent.futures
 import html
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -53,16 +55,31 @@ def first_success(fns):
     succeeds and returns a truthy result. Used for sources that mirror the
     same search across multiple hosts — trying hosts one at a time means a
     single dead host multiplies the wait by its own timeout; racing them
-    bounds the whole thing to about one timeout, no matter how many hosts."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(fns)) as ex:
-        futs = [ex.submit(fn) for fn in fns]
-        for fut in concurrent.futures.as_completed(futs):
-            try:
-                result = fut.result()
-            except Exception:
-                continue
-            if result:
-                return result
+    bounds the whole thing to about one timeout, no matter how many hosts.
+
+    Plain daemon threads, not ThreadPoolExecutor: a pool's worker threads
+    are joined at interpreter exit even after shutdown(wait=False), so
+    returning early here wouldn't stop a slow, still-running mirror from
+    holding up the whole search.py process afterwards — daemon threads
+    are simply dropped when the process exits."""
+    q = queue.Queue()
+
+    def run(fn):
+        try:
+            q.put(fn())
+        except Exception:
+            q.put(None)
+
+    for fn in fns:
+        threading.Thread(target=run, args=(fn,), daemon=True).start()
+
+    for _ in fns:
+        try:
+            result = q.get(timeout=10)
+        except queue.Empty:
+            break
+        if result:
+            return result
     return []
 
 
@@ -447,12 +464,13 @@ def load_enabled():
     if not os.path.exists(path):
         return list(DEFAULT_ENABLED)
     enabled = []
-    for line in open(path, encoding="utf-8"):
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line in ALL_SOURCES:
-            enabled.append(line)
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line in ALL_SOURCES:
+                enabled.append(line)
     return enabled or list(DEFAULT_ENABLED)
 
 
@@ -484,7 +502,7 @@ def main():
 
     results = []
     errors = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(enabled))) as ex:
         futs = {ex.submit(ALL_SOURCES[name], query): name
                 for name in enabled}
         for fut in concurrent.futures.as_completed(futs):

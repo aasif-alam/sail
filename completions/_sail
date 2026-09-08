@@ -1,0 +1,12 @@
+#compdef sail
+# sail zsh completion.
+#
+# Copy this file (as "_sail") onto a directory in your $fpath, e.g.
+# "$(brew --prefix)/share/zsh/site-functions/", then start a new shell.
+
+_arguments \
+    '(-s -d)-s[stream the picked result immediately]' \
+    '(-s -d)-d[download the picked result immediately]' \
+    '-h[show usage]' \
+    '(-v --version)'{-v,--version}'[print the version]' \
+    '1: :(sources)'

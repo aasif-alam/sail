@@ -49,6 +49,9 @@ BIN_DIR="/usr/local/bin"
 if [ ! -w "$BIN_DIR" ]; then
     BIN_DIR="$HOME/.local/bin"
     mkdir -p "$BIN_DIR"
+    # single-quoted below on purpose: $HOME/$PATH must stay literal so
+    # they're re-evaluated by zsh at shell startup, not expanded once here
+    # shellcheck disable=SC2016
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
         *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
@@ -66,6 +69,17 @@ cp -R bin lib "$PKG_HOME/"
 ln -sf "$PKG_HOME/bin/sail" "$BIN_DIR/sail"
 
 mkdir -p "$HOME/Downloads/torrents"
+
+# ---- Shell completion (best-effort — skipped if the target dir is absent) --
+BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+if [ -n "$BREW_PREFIX" ] && [ -d "$BREW_PREFIX/share/zsh/site-functions" ]; then
+    cp completions/_sail "$BREW_PREFIX/share/zsh/site-functions/_sail" 2>/dev/null \
+        && say "Installed zsh completion."
+fi
+if [ -n "$BREW_PREFIX" ] && [ -d "$BREW_PREFIX/etc/bash_completion.d" ]; then
+    cp completions/sail.bash "$BREW_PREFIX/etc/bash_completion.d/sail" 2>/dev/null \
+        && say "Installed bash completion."
+fi
 
 # ---- Verify --------------------------------------------------------------
 say "Verifying installation…"

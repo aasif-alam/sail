@@ -10,8 +10,12 @@ Search, stream, and download torrents entirely from the macOS terminal.
 | `sail -s <query>` | stream the picked result immediately |
 | `sail -d <query>` | download the picked result immediately |
 | `sail sources` | choose which sources every search uses |
+| `sail --version` | print the installed version |
 
 Downloads go to `~/Downloads/torrents` (override with `TORRENT_DOWNLOAD_DIR`).
+Set `SAIL_DEBUG=1` to see each source's own errors (timeouts, parse
+failures) after a search that comes back thin — normally they're discarded
+so a broken scraper doesn't clutter the output.
 
 When streaming a torrent with more than one video file (season packs,
 movies with extras), sail shows a picker so you choose exactly which one
@@ -34,7 +38,7 @@ disk. A live progress line tracks the download the same way streaming does.
 
 ## Sources
 
-Nine sources are built in. Pick and choose the ones every search uses:
+Thirteen sources are built in. Pick and choose the ones every search uses:
 
 ```
 sail sources
@@ -51,6 +55,8 @@ globally. You can also edit that file by hand.
 | `eztv` | TV episodes | JSON API |
 | `knaben` | aggregator, well seeded | HTML scrape |
 | `tcsv` | DHT crawled, open data | JSON API |
+| `tq` | aggregator | HTML scrape |
+| `et` | movies / general | HTML scrape |
 | `solid` | general | JSON API |
 | `nyaa` | anime / Asian media | HTML scrape |
 | `1337x` | general | HTML scrape |
@@ -78,6 +84,32 @@ player, and the `sail` command itself.
 ```bash
 ./uninstall.sh
 ```
+
+## Shell completion
+
+Tab-completion for the `-s`/`-d`/`sources`/`--version` flags lives in
+`completions/`. Source the file for your shell, or drop it wherever your
+shell auto-loads completions:
+
+```bash
+# zsh (e.g. Homebrew's site-functions dir, already on most fpaths)
+cp completions/_sail "$(brew --prefix)/share/zsh/site-functions/_sail"
+
+# bash (needs bash-completion)
+cp completions/sail.bash "$(brew --prefix)/etc/bash_completion.d/sail"
+```
+
+`install.sh` copies both in automatically when it finds those directories.
+
+## Development
+
+```bash
+python3 -m unittest discover tests
+```
+
+Tests mock all network calls — no live requests are made. A GitHub Actions
+workflow ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs them
+plus `shellcheck` on every push and PR.
 
 ## Notes
 

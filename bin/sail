@@ -6,6 +6,10 @@
 #   sail -d <query>     download straight to ~/Downloads
 #   sail -s <query>     stream in your media player
 #   sail sources        choose which sources to search
+#   sail --version      print the version and exit
+#
+# SAIL_DEBUG=1 prints each source's stderr (timeouts, parse errors) after
+# a search instead of discarding it.
 
 set -euo pipefail
 
@@ -17,6 +21,7 @@ else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
 
+SAIL_VERSION="1.1.0"
 DOWNLOAD_DIR="${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}"
 
 # SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
@@ -39,8 +44,11 @@ usage() {
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
 WORK="$(mktemp -d -t sail.XXXXXX)"
-# clean temp files on every exit path — including Ctrl+C and closed windows
-trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && kill "$WT_PID" 2>/dev/null || true; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf /tmp/webtorrent; fi' EXIT INT TERM
+# clean temp files on every exit path — including Ctrl+C and closed windows.
+# WT_PID goes through stop_pid (SIGTERM, then SIGKILL if it doesn't die) —
+# a plain kill can leave an orphaned webtorrent process running in the
+# background when destroy() hangs, per the comment above stop_pid
+trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
 # before this behavior existed (nothing writes here anymore, so after the
@@ -58,6 +66,12 @@ if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
         printf '\e[8;%d;%dt' "$NEW_R" "$NEW_C"
         sleep 0.15
     fi
+fi
+
+# ---- `sail --version` -------------------------------------------------------
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
+    printf 'sail %s\n' "$SAIL_VERSION"
+    exit 0
 fi
 
 # ---- `sail sources` — choose which sources every search uses --------------
@@ -101,7 +115,7 @@ if [ "${1:-}" = "sources" ]; then
         esac
         i=$((n - 1))
         if [ "$i" -ge 0 ] && [ "$i" -lt "${#NAMES[@]}" ]; then
-            if [ "${ON[$i]}" = 1 ]; then ON[$i]=0; else ON[$i]=1; fi
+            if [ "${ON[$i]}" = 1 ]; then ON[i]=0; else ON[i]=1; fi
             DIRTY=1
         fi
     }
@@ -123,8 +137,8 @@ if [ "${1:-}" = "sources" ]; then
                 exit 0
                 ;;
             q|Q) printf '  (not saved)\n'; exit 0 ;;
-            a|A) for i in "${!NAMES[@]}"; do ON[$i]=1; done; DIRTY=1 ;;
-            x|X) for i in "${!NAMES[@]}"; do ON[$i]=0; done; DIRTY=1 ;;
+            a|A) for i in "${!NAMES[@]}"; do ON[i]=1; done; DIRTY=1 ;;
+            x|X) for i in "${!NAMES[@]}"; do ON[i]=0; done; DIRTY=1 ;;
             *)   for n in "${tokens[@]+"${tokens[@]}"}"; do toggle "$n"; done ;;
         esac
     done
@@ -146,7 +160,14 @@ QUERY="$*"
 
 # ---- 1. search ------------------------------------------------------------
 printf '  searching for %s%s%s ' "$CYN" "$QUERY" "$RST"
-python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>/dev/null &
+# SAIL_DEBUG=1 keeps each source's stderr (timeouts, parse failures, etc.)
+# instead of discarding it — a source that silently returns nothing is
+# otherwise impossible to diagnose
+if [ "${SAIL_DEBUG:-0}" = 1 ]; then
+    python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>"$WORK/search.err" &
+else
+    python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>/dev/null &
+fi
 SEARCH_PID=$!
 DOTS=('   ' '.  ' '.. ' '...')
 i=0
@@ -158,6 +179,11 @@ done
 wait "$SEARCH_PID" || true
 printf '%s   %s' "$DIM" "$RST"
 printf '\r%*s\r' 80 ''
+
+if [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/search.err" ]; then
+    printf '  %sdebug:%s\n' "$DIM" "$RST" >&2
+    sed 's/^/    /' "$WORK/search.err" >&2
+fi
 
 if [ ! -s "$WORK/results" ]; then
     printf '  no results for %s%s%s\n' "$BLD" "$QUERY" "$RST"
@@ -332,6 +358,10 @@ pick_video() {
     # picked line(s) via $(...) — anything else printed to stdout here would
     # get parsed as a bogus extra "selection"
     [ -n "$common_dir" ] && printf '  %sin %s%s\n\n' "$DIM" "$common_dir" "$RST" >&2
+    # fzf_extra below is deliberately unquoted: it's a fixed, controlled
+    # string (not user input) that must word-split into separate fzf
+    # flags — see the array-avoidance comment near the top of this function
+    # shellcheck disable=SC2086
     printf '%s\n' "$sorted" | awk -F'\t' -v D="$DIM" -v B="$BLD" -v R="$RST" \
         -v G="$GRN" -v Y="$YLW" -v Rd="$RED" -v CD="$common_dir" '
         function tobytes(s,   n, u) {
@@ -371,7 +401,8 @@ pick_video() {
             printf "%s\t%s\t%s\t%s\n", $1, sizecol, tagcol, pathcol
         }' \
     | fzf --ansi --reverse --height=80% --border=rounded --margin=1,2 \
-          --delimiter='\t' --with-nth=2,3,4 $fzf_extra \
+          --delimiter='\t' --with-nth=2,3,4 \
+          $fzf_extra \
           --header="$header" \
           --header-first
 }
