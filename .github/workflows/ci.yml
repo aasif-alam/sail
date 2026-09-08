@@ -6,7 +6,10 @@ on:
 
 jobs:
   shellcheck:
-    runs-on: macos-latest
+    # ubuntu-latest ships shellcheck preinstalled; macos-latest doesn't.
+    # shellcheck itself only parses the script text — it doesn't need to
+    # run on macOS even though the scripts are macOS-only at runtime.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
