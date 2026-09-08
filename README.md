@@ -14,8 +14,9 @@ Search, stream, and download torrents entirely from the macOS terminal.
 
 Downloads go to `~/Downloads/torrents` (override with `TORRENT_DOWNLOAD_DIR`).
 Set `SAIL_DEBUG=1` to see each source's own errors (timeouts, parse
-failures) after a search that comes back thin — normally they're discarded
-so a broken scraper doesn't clutter the output.
+failures) after a search that comes back thin, and why a subtitle lookup
+came back empty — normally both are discarded so a broken scraper or a
+missing subtitle doesn't clutter the output.
 
 When streaming a torrent with more than one video file (season packs,
 movies with extras), sail shows a picker so you choose exactly which one
@@ -25,6 +26,14 @@ video file plays immediately with no picker.
 Streaming uses IINA, mpv, or VLC, whichever is found first (in that order).
 While a stream plays, the terminal shows a live line of peers, download
 speed, and progress for the file — quit the player to stop.
+
+Set `SAIL_OPENSUBTITLES_KEY` to a free [OpenSubtitles API
+key](https://www.opensubtitles.com/en/consumers) and sail looks up a
+matching subtitle before each stream starts, downloading it fresh (nothing
+is cached) and handing it to the player. `SAIL_SUB_LANG` picks the language
+(default `en`). Without a key set, this is skipped entirely — streaming
+works exactly as before. A macOS notification also fires when a background
+download (`sail -d`) finishes or fails.
 
 Nothing is cached: torrent metadata is fetched fresh on every stream, the
 downloaded video lives in a temp directory that's wiped the moment you quit

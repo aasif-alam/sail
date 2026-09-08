@@ -10,6 +10,10 @@
 #
 # SAIL_DEBUG=1 prints each source's stderr (timeouts, parse errors) after
 # a search instead of discarding it.
+#
+# SAIL_OPENSUBTITLES_KEY, if set, fetches a subtitle from OpenSubtitles
+# before streaming (SAIL_SUB_LANG picks the language, default "en").
+# A macOS notification also fires when a background download finishes.
 
 set -euo pipefail
 
@@ -21,7 +25,7 @@ else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
 
-SAIL_VERSION="1.1.0"
+SAIL_VERSION="1.2.0"
 DOWNLOAD_DIR="${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}"
 
 # SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
@@ -39,6 +43,15 @@ stop_pid() {
 usage() {
     sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
+}
+
+# best-effort macOS notification — never blocks or fails the caller
+notify() {  # $1 = title, $2 = message
+    command -v osascript >/dev/null 2>&1 || return 0
+    local t m
+    t="$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    m="$(printf '%s' "$2" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+    osascript -e "display notification \"$m\" with title \"$t\"" >/dev/null 2>&1 || true
 }
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
@@ -506,6 +519,17 @@ if [ "$MODE" = "stream" ]; then
     fi
     VID_PATH="$(awk -F'\t' -v i="$VID_IDX" '$1 == i {print $3}' "$WORK/files.tsv")"
 
+    # subtitles are opt-in (needs a free OpenSubtitles API key) and best
+    # effort — kicked off now, in the background, so the lookup overlaps
+    # with the stream server starting up instead of adding its own delay
+    SUB_PATH=""
+    SUB_PID=""
+    if [ -n "${SAIL_OPENSUBTITLES_KEY:-}" ]; then
+        python3 "$LIB_DIR/subs.py" "$VID_PATH" "$WORK/sub.srt" \
+            --lang "${SAIL_SUB_LANG:-en}" >"$WORK/sub.path" 2>"$WORK/subs.err" &
+        SUB_PID=$!
+    fi
+
     # run a quiet wt.js stream server and launch the player ourselves:
     # webtorrent's own --iina opens IINA via URL scheme, which doesn't give
     # us a way to know when playback ends (needed to clean up the temp dir),
@@ -533,13 +557,36 @@ if [ "$MODE" = "stream" ]; then
     fi
     STREAM_URL="http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$URLPATH"
 
+    if [ -n "$SUB_PID" ]; then
+        wait "$SUB_PID" 2>/dev/null || true
+        if [ -s "$WORK/sub.path" ]; then
+            SUB_PATH="$(cat "$WORK/sub.path")"
+            printf '  %ssubtitles: %s%s\n' "$DIM" "$(basename "$SUB_PATH")" "$RST"
+        elif [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/subs.err" ]; then
+            printf '  %ssubtitles:%s\n' "$DIM" "$RST" >&2
+            sed 's/^/    /' "$WORK/subs.err" >&2
+        fi
+    fi
+
     printf '  streaming — quit the player to stop\n\n'
     render_status &
     RENDER_PID=$!
     case "$PLAYER" in
-        iina) "$IINA_CLI" --keep-running "$STREAM_URL" ;;
-        mpv)  mpv "$STREAM_URL" ;;
-        vlc)  vlc "$STREAM_URL" ;;
+        iina) if [ -n "$SUB_PATH" ]; then
+                  "$IINA_CLI" --keep-running --mpv-sub-file="$SUB_PATH" "$STREAM_URL"
+              else
+                  "$IINA_CLI" --keep-running "$STREAM_URL"
+              fi ;;
+        mpv)  if [ -n "$SUB_PATH" ]; then
+                  mpv --sub-file="$SUB_PATH" "$STREAM_URL"
+              else
+                  mpv "$STREAM_URL"
+              fi ;;
+        vlc)  if [ -n "$SUB_PATH" ]; then
+                  vlc --sub-file="$SUB_PATH" "$STREAM_URL"
+              else
+                  vlc "$STREAM_URL"
+              fi ;;
     esac
     # player closed — the EXIT trap kills the webtorrent server and wipes
     # $WORK (including the streamed video)
@@ -584,7 +631,9 @@ else
     printf '\r%*s\r' 80 ''
     if [ "$WT_STATUS" -eq 0 ]; then
         printf '  %sdone%s — saved to %s%s%s\n' "$GRN" "$RST" "$CYN" "$DOWNLOAD_DIR" "$RST"
+        notify "sail" "Download complete: $SEL_TITLE"
     else
         printf '  %sdownload didn'"'"'t finish cleanly (%s)%s\n' "$RED" "$WT_STATUS" "$RST"
+        notify "sail" "Download failed: $SEL_TITLE"
     fi
 fi
