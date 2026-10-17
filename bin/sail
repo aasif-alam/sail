@@ -25,7 +25,7 @@ else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
 
-SAIL_VERSION="1.3.0"
+SAIL_VERSION="1.4.0"
 DOWNLOAD_DIR="${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}"
 
 # SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
@@ -38,6 +38,19 @@ stop_pid() {
         sleep 0.5
     done
     kill -9 "$p" 2>/dev/null || true
+}
+
+# stop the dashboard renderer and clear its block. TERM first (it's usually
+# mid-sleep, and bash only runs its cleanup trap once sleep returns), a
+# short grace, then SIGKILL — so it can never redraw a frame after our
+# cleanup. Moving the cursor back up DASH_H lines and erasing from there
+# wipes the whole block in one shot
+stop_render() {
+    [ -n "${RENDER_PID:-}" ] || return 0
+    kill "$RENDER_PID" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$RENDER_PID" 2>/dev/null || true
+    printf '\033[%dA\033[J\033[?25h' "${DASH_H:-15}"
 }
 
 usage() {
@@ -64,7 +77,7 @@ WORK="$(mktemp -d -t sail.XXXXXX)"
 # break the NEXT run with "address already in use") when destroy() hangs,
 # per the comment above stop_pid — WPID is the metadata-fetch process
 # (the wt.js meta invocation below), which runs well before WT_PID exists
-trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
+trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; if [ -n "${RENDER_PID:-}" ]; then stop_render; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
 # before this behavior existed (nothing writes here anymore, so after the
@@ -523,40 +536,116 @@ pick_video() {
           --header-first
 }
 
-# live torrent stats while streaming or downloading — wt.js emits one
-# tab-separated STATUS line per second to wt.log; redraw a single terminal
-# line in place from the latest one. Runs as a background job (RENDER_PID);
-# the EXIT trap kills it and clears the line
+# live torrent dashboard while streaming or downloading — wt.js emits one
+# "PEERS\t..." (per-wire detail) plus one "STATUS\t..." line per second to
+# wt.log; redraw a fixed-height block in place from the newest pair. Runs
+# as a background job (RENDER_PID); stop_render tears it down and clears
+# the block. Fixed height + \033[K on every line means redraws never leave
+# artifacts behind, whatever the peer count does
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
-render_status() {
-    local i=0 line peers pct down total speed filled empty bar pc k chunk
+DASH_H=15
+BAR_W=30
+
+# multibyte-safe truncation — awk counts characters under a UTF-8 locale,
+# while bash 3.2's ${s:0:n} counts bytes when no locale is set and would
+# cut a Unicode char in half
+cutw() {
+    LC_ALL=en_US.UTF-8 awk -v w="$2" '{ s = $0
+        if (length(s) > w) s = substr(s, 1, w - 1) "…"
+        printf "%s", s }' <<< "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# speed samples as one space-separated string (KB/s) -> block-character
+# sparkline. Takes the samples as $1, not stdin: a background job's stdin
+# is /dev/null, so an awk-without-file here would silently print nothing.
+# Block chars are split on "|" instead of sliced with substr, which is
+# byte-based under the C locale and would mangle them — same reason the
+# progress bar below is built char-by-char in bash
+spark() {
+    awk -v vals="$1" -v B='▁|▂|▃|▄|▅|▆|▇|█' 'BEGIN {
+        n = split(B, ch, "|")
+        max = 0
+        m = split(vals, v, " ")
+        for (i = 1; i <= m; i++) if ((v[i] + 0) > max) max = v[i] + 0
+        out = ""
+        for (i = 1; i <= m; i++) {
+            lvl = max > 0 ? int((v[i] + 0) / max * (n - 1) + 0.5) : 0
+            out = out ch[lvl + 1]
+        }
+        printf "%s", out
+    }'
+}
+
+render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = torrent title
+    local mode="$1" what="$2" title="$3"
+    local i=0 line peerline peers pct down total speed up upl eta ratio known
+    local filled empty k chunk bar pc hist kb addr client d u have slot el
+    SECONDS=0
+    hist=$(printf '0 %.0s' $(seq 1 42))
+    printf '\033[?25l'
+    trap 'printf "\033[?25h"' TERM
     while :; do
-        line="$(tail -n 1 "$WORK/wt.log" 2>/dev/null || true)"
+        line="$( { tail -n 12 "$WORK/wt.log" 2>/dev/null || true; } | awk 'index($0, "STATUS\t") == 1 { l = $0 } END { print l }' )"
+        peerline="$( { tail -n 12 "$WORK/wt.log" 2>/dev/null || true; } | awk 'index($0, "PEERS\t") == 1 { l = $0 } END { print l }' )"
+        peers=0 pct=0 down="0.0B" total="0.0B" speed="0.0B/s"
+        up="0.0B/s" upl="0.0B" eta="…" ratio="0.00" known=0
         case "$line" in
             STATUS*)
-                IFS=$'\t' read -r _ peers pct down total speed <<< "$line"
-                peers="${peers:-0}"; pct="${pct:-0}"
-                filled=$(( pct * 22 / 100 )); empty=$(( 22 - filled ))
-                # built char-by-char in bash, not via `tr`: `tr` mangles
-                # multi-byte UTF-8 under the C locale (the common default
-                # when a shell has no LANG/LC_ALL set), turning the block
-                # characters into invalid byte garbage
-                chunk=""
-                for ((k = 0; k < filled; k++)); do chunk+="█"; done
-                bar="${GRN}${chunk}"
-                chunk=""
-                for ((k = 0; k < empty; k++)); do chunk+="░"; done
-                bar+="${DIM}${chunk}${RST}"
-                if [ "$peers" -eq 0 ]; then pc="$RED"
-                elif [ "$peers" -lt 5 ]; then pc="$YLW"
-                else pc="$GRN"; fi
-                printf '\r  %s%s%s  %s  %s%3s%%%s   %s%2s%s peers   %s%-9s%s   %s%s/%s%s\033[K' \
-                    "$CYN" "${SPIN[$((i % 10))]}" "$RST" "$bar" \
-                    "$BLD" "$pct" "$RST" "$pc" "$peers" "$RST" \
-                    "$YLW" "$speed" "$RST" "$DIM" "$down" "$total" "$RST"
-                i=$((i + 1))
+                IFS=$'\t' read -r _ peers pct down total speed up upl eta ratio known <<< "$line"
                 ;;
         esac
+        case "$pct"   in ''|*[!0-9]*) pct=0 ;;   esac
+        case "$peers" in ''|*[!0-9]*) peers=0 ;; esac
+        case "$known" in ''|*[!0-9]*) known=0 ;; esac
+
+        # speed history — last 42 samples, converted to KB/s, for the sparkline
+        kb="$(awk -v s="${speed%/s}" 'BEGIN{ v=s+0; u=s; sub(/^[0-9.]+/,"",u); m=(u~/^KB/)?1024:(u~/^MB/)?1048576:(u~/^GB/)?1073741824:1; printf "%.0f", v*m/1024 }')"
+        hist="$(printf '%s' "$hist" | awk -v add="$kb" '{ for (i = 2; i <= NF; i++) printf "%s ", $i; printf "%s", add }')"
+
+        [ "$i" -gt 0 ] && printf '\033[%dA' "$DASH_H"
+        filled=$(( pct * BAR_W / 100 )); empty=$(( BAR_W - filled ))
+        # built char-by-char in bash, not via `tr`: `tr` mangles multi-byte
+        # UTF-8 under the C locale (the common default when a shell has no
+        # LANG/LC_ALL set), turning the block characters into invalid garbage
+        chunk=""; for ((k = 0; k < filled; k++)); do chunk+="█"; done
+        bar="${GRN}${chunk}"
+        chunk=""; for ((k = 0; k < empty; k++)); do chunk+="░"; done
+        bar+="${DIM}${chunk}${RST}"
+        if [ "$peers" -eq 0 ]; then pc="$RED"
+        elif [ "$peers" -lt 5 ]; then pc="$YLW"
+        else pc="$GRN"; fi
+        el="$((SECONDS / 60))m$(printf '%02d' $((SECONDS % 60)))s"
+
+        printf '%s%s%s  %s%s%s  %st %s%s\033[K\n' \
+            "$CYN" "${SPIN[$((i % 10))]}" "$RST" "$BLD" "$mode" "$RST" "$DIM" "$el" "$RST"
+        printf '  %s%s%s\033[K\n' "$BLD" "$(cutw "$title" 118)" "$RST"
+        printf '  %s%s%s\033[K\n' "$DIM" "$(cutw "$what" 118)" "$RST"
+        printf '  %s  %s%3s%%%s\033[K\n' "$bar" "$BLD" "$pct" "$RST"
+        printf '  %s↓ %s%s   %s↑ %s%s   %sratio %s%s\033[K\n' \
+            "$CYN" "$speed" "$RST" "$YLW" "$up" "$RST" "$DIM" "$ratio" "$RST"
+        printf '  %s%s / %s downloaded   %s uploaded   %seta %s%s%s\033[K\n' \
+            "$DIM" "$down" "$total" "$upl" "$RST" "$BLD" "$eta" "$RST"
+        printf '  %s%s%s\033[K\n' "$CYN" "$(spark "$hist")" "$RST"
+        printf '  %speers%s %s%s%s / %s%s known%s\033[K\n' \
+            "$BLD" "$RST" "$pc" "$peers" "$RST" "$DIM" "$known" "$RST"
+        printf '  %s%-21s %-16s %10s %10s  %6s%s\033[K\n' \
+            "$DIM" ip client down up have "$RST"
+        slot=0
+        if [ -n "$peerline" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                IFS='|' read -r addr client d u have <<< "$p"
+                slot=$((slot + 1))
+                [ "$slot" -le 6 ] || break
+                printf '  %-21s %s%-16s%s %10s %10s  %s%6s%s\033[K\n' \
+                    "${addr:0:21}" "$DIM" "$(cutw "$client" 16)" "$RST" "$d" "$u" "$YLW" "$have" "$RST"
+            done <<< "$(printf '%s' "$peerline" | sed $'s/^PEERS\t//' | tr ';' '\n')"
+        fi
+        while [ "$slot" -lt 6 ]; do
+            slot=$((slot + 1))
+            printf '\033[K\n'
+        done
+        i=$((i + 1))
         sleep 0.5
     done
 }
@@ -714,7 +803,7 @@ if [ "$MODE" = "stream" ]; then
     fi
 
     printf '  streaming — quit the player to stop\n\n'
-    render_status &
+    render_status "STREAMING" "file: $(basename "$VID_PATH")" "$SEL_TITLE" &
     RENDER_PID=$!
     case "$PLAYER" in
         iina) if [ -n "$SUB_PATH" ]; then
@@ -775,12 +864,11 @@ else
         "$SEL_IDXS" "$OPTS_JSON" >"$WORK/wt.log" 2>&1 &
     WT_PID=$!
     STREAMING=1
-    render_status &
+    render_status "DOWNLOADING" "$N_SEL file$([ "$N_SEL" = 1 ] || printf s) to $DOWNLOAD_DIR" "$SEL_TITLE" &
     RENDER_PID=$!
     WT_STATUS=0
     wait "$WT_PID" || WT_STATUS=$?
-    kill "$RENDER_PID" 2>/dev/null || true
-    printf '\r%*s\r' 80 ''
+    stop_render
     if [ "$WT_STATUS" -eq 0 ]; then
         printf '  %sdone%s — saved to %s%s%s\n' "$GRN" "$RST" "$CYN" "$DOWNLOAD_DIR" "$RST"
         notify "sail" "Download complete: $SEL_TITLE"

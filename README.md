@@ -25,8 +25,11 @@ plays — only that file is downloaded, never the whole torrent. A single
 video file plays immediately with no picker.
 
 Streaming uses IINA, mpv, or VLC, whichever is found first (in that order).
-While a stream plays, the terminal shows a live line of peers, download
-speed, and progress for the file — quit the player to stop.
+While a stream plays, the terminal shows a live dashboard — progress bar,
+download/upload speeds with a scrolling speed sparkline, ETA, ratio, and a
+peer table listing each peer's client (qBittorrent, Transmission, …),
+per-peer speeds, and how much of the torrent it has.
+Quit the player to stop.
 
 If the torrent itself includes a subtitle file for the video you picked
 (scene releases for TV episodes often do), sail finds and streams it
@@ -48,7 +51,7 @@ removed on startup.
 Downloading (`sail -d`) uses the same picker: a season pack with several
 video files lets you pick exactly which ones to save — tab toggles, ctrl-a
 selects all, ctrl-d clears — and only the files you picked are written to
-disk. A live progress line tracks the download the same way streaming does.
+disk. A live dashboard tracks the download the same way streaming does.
 
 ## Sources
 
