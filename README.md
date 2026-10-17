@@ -10,6 +10,7 @@ Search, stream, and download torrents entirely from the macOS terminal.
 | `sail -s <query>` | stream the picked result immediately |
 | `sail -d <query>` | download the picked result immediately |
 | `sail sources` | choose which sources every search uses |
+| `sail wlist [query]` | launch or manage the watchlist (save from results with ctrl-x) |
 | `sail --version` | print the installed version |
 
 Downloads go to `~/Downloads/torrents` (override with `TORRENT_DOWNLOAD_DIR`).
@@ -82,6 +83,23 @@ With no config file, searches use `tpb`, `yts`, `eztv`, `knaben`, `tcsv`, and
 Scraped sources depend on site layout and can break when sites change;
 a failing source never blocks the others.
 
+## Watchlist
+
+Press `ctrl-x` on any search result to save it to the watchlist — the list
+stays open so you can save several in one pass, and the header confirms each
+save. `sail wlist` shows saved torrents: enter launches one straight to the
+stream/download prompt (the search step is skipped entirely), `ctrl-x`
+removes it, esc quits. An optional query narrows the list: `sail wlist dune`.
+
+Entries live in `~/.config/sail/wlist.tsv` — title, magnet link, and the
+date added, one per line, safe to edit by hand. The magnet carries the
+torrent's trackers, so a saved entry still launches long after it has left
+the search results. Re-adding a torrent moves it to the top instead of
+duplicating it.
+
+`cmd+x` would have read nicer, but terminals swallow it for their Edit
+menu — CLI apps never see that keystroke — so the binding is `ctrl-x`.
+
 ## Install
 
 ```bash
@@ -127,4 +145,10 @@ plus `shellcheck` on every push and PR.
 ## Notes
 
 - Streaming needs a reasonably well-seeded torrent; rare files will stutter.
+- webtorrent-cli 6.x ships webtorrent 2.8.5, which crashes on *every*
+  torrent add when its `uint8-util` dependency resolves to 2.3+ (it passes
+  the info-hash string to an API that now only accepts typed arrays; fixed
+  upstream in webtorrent 3.x). sail checks for this at startup and repairs
+  it in place — `lib/fix-webtorrent.sh` does the same standalone, and
+  `brew reinstall webtorrent-cli` undoes the patch.
 - Only download content you are legally permitted to obtain.

@@ -29,6 +29,11 @@ brew list fzf >/dev/null 2>&1 || brew install fzf
 say "Installing webtorrent-cli (torrent engine)…"
 brew list webtorrent-cli >/dev/null 2>&1 || brew install webtorrent-cli
 
+# webtorrent-cli 6.x ships webtorrent 2.8.5, which crashes on every
+# torrent add once its uint8-util dependency resolves to >=2.3 — repair
+# right away (no-op when the install is healthy)
+bash lib/fix-webtorrent.sh
+
 say "Installing media player (IINA)…"
 # IINA is fine whether it was installed via brew or manually — only install
 # the cask when the app is truly absent, since brew refuses to overwrite it.

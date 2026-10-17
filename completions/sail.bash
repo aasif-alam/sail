@@ -7,7 +7,7 @@ _sail() {
     local cur
     cur="${COMP_WORDS[COMP_CWORD]}"
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "sources -s -d -h -v --version" -- "$cur"))
+        COMPREPLY=($(compgen -W "sources wlist -s -d -h -v --version" -- "$cur"))
     fi
 }
 complete -F _sail sail

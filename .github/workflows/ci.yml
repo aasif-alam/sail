@@ -13,11 +13,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck bin/sail install.sh uninstall.sh
+        run: shellcheck bin/sail install.sh uninstall.sh lib/fix-webtorrent.sh lib/wlist.sh
 
   test:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: run tests
-        run: python3 -m unittest discover tests -v
+        run: |
+          python3 -m unittest discover tests -v
+          bash tests/test_fix_webtorrent.sh
+          bash tests/test_wlist.sh
+          bash tests/test_wlist_ui.sh

@@ -9,4 +9,4 @@ _arguments \
     '(-s -d)-d[download the picked result immediately]' \
     '-h[show usage]' \
     '(-v --version)'{-v,--version}'[print the version]' \
-    '1: :(sources)'
+    '1: :(sources wlist)'
