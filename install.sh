@@ -5,6 +5,21 @@ set -euo pipefail
 say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ---- one-line install (curl | bash) ---------------------------------------
+# Piping this file straight from GitHub runs it with no repo on disk ($0 is
+# "bash", so there is no bin/ or lib/ next to the script). Fetch a tarball of
+# main into a temp dir and re-run the real installer from there — the tarball
+# needs only curl + tar, both stock on macOS, so git isn't a prerequisite.
+# A cloned checkout always has bin/sail beside this script, so this block
+# only ever fires for the piped path.
+if [ ! -f "$(dirname "$0")/bin/sail" ]; then
+    say "Fetching the sail repository…"
+    TMP="$(mktemp -d)"
+    curl -fsSL https://github.com/aasif-alam/sail/archive/refs/heads/main.tar.gz \
+        | tar -xz -C "$TMP"
+    exec bash "$TMP"/sail-main/install.sh
+fi
+
 cd "$(dirname "$0")"
 
 # ---- Homebrew ------------------------------------------------------------

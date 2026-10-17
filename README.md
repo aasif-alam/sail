@@ -102,7 +102,19 @@ menu — CLI apps never see that keystroke — so the binding is `ctrl-x`.
 
 ## Install
 
+Requires macOS. The one-liner — installs Homebrew if it's missing, then
+everything else itself:
+
 ```bash
+curl -fsSL https://raw.githubusercontent.com/aasif-alam/sail/main/install.sh | bash
+```
+
+Piping the installer from GitHub is safe to run because it fetches the rest of
+the repo itself; if you'd rather inspect before executing, clone and run it
+directly — it behaves identically:
+
+```bash
+git clone https://github.com/aasif-alam/sail.git
 cd sail
 ./install.sh
 ```
