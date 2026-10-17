@@ -19,13 +19,29 @@ wlist_file() {
     printf '%s' "${SAIL_WLIST:-$HOME/.config/sail/wlist.tsv}"
 }
 
+# btih info hash for dedup, extracted with bash's own regex — the dedup
+# loops in wlist_add/wlist_remove run this once per stored row, and the old
+# printf|sed|tr pipeline cost ~3 subprocesses per row (a 200-row watchlist
+# paid ~0.9s per save). Sets WLIST_KEY instead of printing so those loops
+# need no $( ) subshell per row either. bash-3.2 notes: the regex lives in
+# a variable because 3.2 treats quoted characters in a [[ =~ ]] pattern as
+# literals, and ${var,,} lowercasing is 4.0+ — hence the per-letter
+# expansions (hex digits only, so six of them cover it).
+WLIST_BTIH_RE='[?&]xt=urn:btih:([0-9A-Fa-f]{32,})'
+_wlist_key_of() {  # $1 = magnet -> sets WLIST_KEY
+    WLIST_KEY="$1"
+    if [[ "$1" =~ $WLIST_BTIH_RE ]]; then
+        WLIST_KEY="${BASH_REMATCH[1]}"
+        WLIST_KEY="${WLIST_KEY//A/a}"; WLIST_KEY="${WLIST_KEY//B/b}"
+        WLIST_KEY="${WLIST_KEY//C/c}"; WLIST_KEY="${WLIST_KEY//D/d}"
+        WLIST_KEY="${WLIST_KEY//E/e}"; WLIST_KEY="${WLIST_KEY//F/f}"
+    fi
+}
+
 # dedup key: the btih info hash if the magnet has one, else the whole string
 wlist_key() {
-    local h
-    h="$(printf '%s' "$1" \
-        | sed -n 's/.*[?&]xt=urn:btih:\([0-9A-Fa-f]\{32,\}\).*/\1/p' \
-        | tr 'A-F' 'a-f')"
-    if [ -n "$h" ]; then printf '%s' "$h"; else printf '%s' "$1"; fi
+    _wlist_key_of "$1"
+    printf '%s' "$WLIST_KEY"
 }
 
 # wlist_add <title> <magnet>
@@ -36,24 +52,29 @@ wlist_add() {
     title="${title#"${title%%[![:space:]]*}"}"   # ltrim
     title="${title%"${title##*[![:space:]]}"}"   # rtrim
     [ -n "$title" ] && [ -n "$magnet" ] || return 2
-    key="$(wlist_key "$magnet")"
+    _wlist_key_of "$magnet"; key="$WLIST_KEY"
     f="$(wlist_file)"
     mkdir -p "$(dirname "$f")"
     touch "$f"
     tmp="$f.tmp.$$"
-    : > "$tmp"
-    while IFS=$'\t' read -r t m ts || [ -n "$t" ]; do
-        [ -n "$t" ] || continue
-        # drop any existing row for this torrent — it's re-appended below
-        # with a fresh timestamp, which is what bumps it to newest
-        if [ "$(wlist_key "$m")" = "$key" ]; then
-            found=1
-            continue
-        fi
-        printf '%s\t%s\t%s\n' "$t" "$m" "$ts" >> "$tmp"
-    done < "$f"
     now="$(date +%s)"
-    printf '%s\t%s\t%s\n' "$title" "$magnet" "$now" >> "$tmp"
+    # one redirect for the whole rewrite — reopening the temp file with >>
+    # per surviving row cost a file open per row; the loop body itself is
+    # pure bash (see _wlist_key_of), so no subprocesses per row anywhere
+    {
+        while IFS=$'\t' read -r t m ts || [ -n "$t" ]; do
+            [ -n "$t" ] || continue
+            # drop any existing row for this torrent — it's re-appended below
+            # with a fresh timestamp, which is what bumps it to newest
+            _wlist_key_of "$m"
+            if [ "$WLIST_KEY" = "$key" ]; then
+                found=1
+                continue
+            fi
+            printf '%s\t%s\t%s\n' "$t" "$m" "$ts"
+        done < "$f"
+        printf '%s\t%s\t%s\n' "$title" "$magnet" "$now"
+    } > "$tmp"
     mv "$tmp" "$f"
     return "$found"
 }
@@ -63,19 +84,21 @@ wlist_add() {
 wlist_remove() {
     local key f tmp removed=0 t="" m="" ts=""
     [ -n "$1" ] || return 1
-    key="$(wlist_key "$1")"
+    _wlist_key_of "$1"; key="$WLIST_KEY"
     f="$(wlist_file)"
     [ -f "$f" ] || return 1
     tmp="$f.tmp.$$"
-    : > "$tmp"
-    while IFS=$'\t' read -r t m ts || [ -n "$t" ]; do
-        [ -n "$t" ] || continue
-        if [ "$(wlist_key "$m")" = "$key" ]; then
-            removed=1
-            continue
-        fi
-        printf '%s\t%s\t%s\n' "$t" "$m" "$ts" >> "$tmp"
-    done < "$f"
+    {
+        while IFS=$'\t' read -r t m ts || [ -n "$t" ]; do
+            [ -n "$t" ] || continue
+            _wlist_key_of "$m"
+            if [ "$WLIST_KEY" = "$key" ]; then
+                removed=1
+                continue
+            fi
+            printf '%s\t%s\t%s\n' "$t" "$m" "$ts"
+        done < "$f"
+    } > "$tmp"
     mv "$tmp" "$f"
     [ "$removed" -eq 1 ]
 }

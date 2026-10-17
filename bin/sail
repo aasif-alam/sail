@@ -63,7 +63,7 @@ WORK="$(mktemp -d -t sail.XXXXXX)"
 # webtorrent process running in the background (holding ports that then
 # break the NEXT run with "address already in use") when destroy() hangs,
 # per the comment above stop_pid — WPID is the metadata-fetch process
-# started in read_meta below, which runs well before WT_PID exists
+# (the wt.js meta invocation below), which runs well before WT_PID exists
 trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; if [ -n "${RENDER_PID:-}" ]; then kill "$RENDER_PID" 2>/dev/null || true; printf "\r%*s\r\n" 80 ""; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
@@ -403,55 +403,45 @@ fi
 mkdir -p "$DOWNLOAD_DIR"
 
 # ---- shared: read the torrent's file list, whichever mode we're in --------
-# metadata is fetched fresh every time — nothing is cached to disk. NOTE:
-# downloadmeta must NOT run with --quiet — quiet skips registering its
-# metadata listener, so it would never write the file
+# metadata is fetched fresh every time — nothing is cached to disk. One
+# wt.js meta process does what used to take three (webtorrent downloadmeta
+# + webtorrent info + a python json->tsv converter): it pulls the metadata
+# and writes <infohash>.torrent, info.json and files.tsv into $WORK, then
+# exits — files.tsv appearing is the success signal (it's written last,
+# via rename, so a killed run can't leave a truncated list). Skipped when
+# there's no webtorrent module: both modes fall back to webtorrent's own
+# picker/downloader anyway, which is where a missing file list sends them
 META=""
 
-read_meta() {  # $1 = .torrent file -> info.json + files.tsv; 0 if valid
-    webtorrent info "$1" > "$WORK/info.json" 2>/dev/null \
-        && [ -s "$WORK/info.json" ] \
-        && python3 - "$WORK/info.json" > "$WORK/files.tsv" <<'PY'
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(1)
-files = d.get("files") or [{"path": d.get("name", "file"), "length": d.get("length", 0)}]
-def h(n):
-    n = float(n)
-    for u in ("B", "KB", "MB", "GB", "TB"):
-        if n < 1024:
-            return f"{n:.1f}{u}"
-        n /= 1024
-    return f"{n:.1f}PB"
-for i, f in enumerate(files):
-    print(f"{i}\t{h(f['length'])}\t{f['path']}")
-PY
-}
-
 printf '  reading torrent info %s' "$DIM"
-for META_TRY in 1 2; do
-    webtorrent downloadmeta "$MAGNET" --out "$WORK" 2>/dev/null &
-    WPID=$!
-    i=0
-    while kill -0 "$WPID" 2>/dev/null; do
-        [ "$i" -ge "${SAIL_META_WAIT:-300}" ] && break
-        printf '%s\b\b\b' "${DOTS[$((i % 4))]}"
-        i=$((i + 1)); sleep 0.5
+if [ -n "$WTMOD" ]; then
+    for META_TRY in 1 2; do
+        node "$LIB_DIR/wt.js" "$WTMOD" meta "$MAGNET" "$WORK" \
+            >"$WORK/meta.log" 2>&1 &
+        WPID=$!
+        i=0
+        while kill -0 "$WPID" 2>/dev/null; do
+            [ "$i" -ge "${SAIL_META_WAIT:-300}" ] && break
+            printf '%s\b\b\b' "${DOTS[$((i % 4))]}"
+            i=$((i + 1)); sleep 0.5
+        done
+        stop_pid "$WPID"
+        printf '%s\r%*s\r' "$RST" 80 ''
+        if [ -s "$WORK/files.tsv" ]; then
+            META="$(find "$WORK" -maxdepth 1 -name '*.torrent' -print -quit)"
+            break
+        fi
+        META=""
+        if [ "$META_TRY" != 2 ]; then
+            printf '  %sno peers yet — retrying %s' "$DIM" "$DIM"
+        fi
     done
-    stop_pid "$WPID"
-    printf '%s\r%*s\r' "$RST" 80 ''
-    META="$(find "$WORK" -maxdepth 1 -name '*.torrent' -print -quit)"
-    if [ -n "$META" ] && read_meta "$META"; then
-        break
-    fi
-    META=""
-    if [ "$META_TRY" != 2 ]; then
-        printf '  %sno peers yet — retrying %s' "$DIM" "$DIM"
-    fi
-done
+fi
 printf '\n'
+if [ -z "$META" ] && [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/meta.log" ]; then
+    printf '  %smeta debug:%s\n' "$DIM" "$RST" >&2
+    sed 's/^/    /' "$WORK/meta.log" >&2
+fi
 
 VIDS=""
 if [ -s "$WORK/files.tsv" ]; then
@@ -674,7 +664,10 @@ if [ "$MODE" = "stream" ]; then
     # us a way to know when playback ends (needed to clean up the temp dir),
     # so we drive both the server and the player directly for one
     # consistent, controllable launch path
-    INFOHASH="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["infoHash"])' "$WORK/info.json")"
+    # the meta phase names the .torrent file after the info hash, so the
+    # hash is right there in $META's basename — no json parse, no python
+    INFOHASH="${META##*/}"
+    INFOHASH="${INFOHASH%.torrent}"
     URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$VID_PATH")"
     node "$LIB_DIR/wt.js" "$WTMOD" serve "$META" "$WORK/stream" \
         "$SERVE_SEL" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
