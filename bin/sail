@@ -50,6 +50,9 @@ stop_render() {
     kill "$RENDER_PID" 2>/dev/null || true
     sleep 0.3
     kill -9 "$RENDER_PID" 2>/dev/null || true
+    # reap it ourselves, else bash reports the SIGKILL as
+    # "line NNN: PID Killed: 9 render_status ..." at the next prompt
+    wait "$RENDER_PID" 2>/dev/null
     printf '\033[%dA\033[J\033[?25h' "${DASH_H:-15}"
 }
 
