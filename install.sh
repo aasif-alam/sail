@@ -2,8 +2,14 @@
 # sail installer — installs all dependencies and the sail command itself.
 set -euo pipefail
 
-say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
-err() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+# color only a real terminal (and honor NO_COLOR, https://no-color.org)
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    GRN=$'\e[1;32m'; RED=$'\e[1;31m'; RST=$'\e[0m'
+else
+    GRN=""; RED=""; RST=""
+fi
+say() { printf '%s==>%s %s\n' "$GRN" "$RST" "$*"; }
+err() { printf '%sError:%s %s\n' "$RED" "$RST" "$*" >&2; exit 1; }
 
 # ---- one-line install (curl | bash) ---------------------------------------
 # Piping this file straight from GitHub runs it with no repo on disk ($0 is
@@ -109,4 +115,4 @@ done
 command -v iina >/dev/null 2>&1 || command -v mpv >/dev/null 2>&1 || \
     say "Note: iina/mpv not on PATH — IINA app is installed; streaming will still work."
 
-printf '\n\033[1;32mDone!\033[0m Try it with:\n\n    sail ubuntu\n\n'
+printf '\n%sDone!%s Try it with:\n\n    sail ubuntu\n\n' "$GRN" "$RST"
