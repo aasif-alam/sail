@@ -36,12 +36,18 @@ wlist_lock() {
     lock="$f.lock"
     while ! mkdir "$lock" 2>/dev/null; do
         i=$((i + 1))
-        if [ "$i" -ge 50 ] \
-           && find "$lock" -maxdepth 0 -mmin +1 -print -quit 2>/dev/null \
-              | grep -q .; then
-            rmdir "$lock" 2>/dev/null || true
-            i=0
-            continue
+        if [ "$i" -ge 50 ]; then
+            # steal a lock left by a crashed writer once it is a minute old
+            if find "$lock" -maxdepth 0 -mmin +1 -print -quit 2>/dev/null \
+               | grep -q .; then
+                rmdir "$lock" 2>/dev/null || true
+                i=0
+                continue
+            fi
+            # a live writer holds this for milliseconds; never hang the UI
+            # (also avoids a spin when the config dir is read-only)
+            WLIST_LOCK=""
+            return 0
         fi
         sleep 0.1
     done
