@@ -48,12 +48,19 @@ stop_pid() {
 # wipes the whole block in one shot
 stop_render() {
     [ -n "${RENDER_PID:-}" ] || return 0
-    kill "$RENDER_PID" 2>/dev/null || true
+    local pid="$RENDER_PID"
+    # clear the slot first: download mode calls stop_render explicitly and
+    # the EXIT trap checks it again — a second stop would erase the done/
+    # error lines printed in between
+    RENDER_PID=""
+    kill "$pid" 2>/dev/null || true
     sleep 0.3
-    kill -9 "$RENDER_PID" 2>/dev/null || true
+    kill -9 "$pid" 2>/dev/null || true
     # reap it ourselves, else bash reports the SIGKILL as
-    # "line NNN: PID Killed: 9 render_status ..." at the next prompt
-    wait "$RENDER_PID" 2>/dev/null
+    # "line NNN: PID Killed: 9 render_status ..." at the next prompt.
+    # wait returns 137 after that SIGKILL; without || true, set -e would
+    # abort here — before the block is cleared and before callers print
+    wait "$pid" 2>/dev/null || true
     printf '\033[%dA\033[J\033[?25h' "${DASH_H:-15}"
 }
 
