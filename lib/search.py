@@ -95,6 +95,21 @@ def human_size(n):
     return f"{n:.1f}PB"
 
 
+def _int(value, default=0):
+    """int() that tolerates commas, whitespace, and scraped junk."""
+    try:
+        return int(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _clean_title(value):
+    """Single-line title: unescape entities and collapse all whitespace."""
+    text = html.unescape(str(value if value is not None else "?"))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "?"
+
+
 def ago(epoch):
     """Relative age like '3mo ago' from a unix timestamp."""
     try:
@@ -125,15 +140,16 @@ def search_apibay(query):
     for t in data:
         if not isinstance(t, dict) or t.get("id") in ("0", None):
             continue
-        if int(t.get("seeders", 0) or 0) <= 0:
+        if _int(t.get("seeders")) <= 0:
             continue
+        title = _clean_title(t.get("name"))
         out.append({
-            "title": html.unescape(t["name"]),
-            "seeders": int(t.get("seeders", 0) or 0),
-            "size": human_size(t.get("size", 0)),
+            "title": title,
+            "seeders": _int(t.get("seeders")),
+            "size": human_size(_int(t.get("size"))),
             "source": "tpb",
             "age": ago(t.get("added")),
-            "magnet": magnet_from_hash(t["info_hash"], t["name"]),
+            "magnet": magnet_from_hash(t["info_hash"], title),
         })
     return out
 
@@ -146,13 +162,14 @@ def search_yts(query):
     for m in (data.get("data") or {}).get("movies") or []:
         for t in m.get("torrents") or []:
             out.append({
-                "title": f"{m['title']} ({m['year']}) "
-                         f"{t['quality']} {t['type']}",
-                "seeders": int(t.get("seeds", 0) or 0),
+                "title": _clean_title(
+                    f"{m['title']} ({m['year']}) {t['quality']} {t['type']}"),
+                "seeders": _int(t.get("seeds")),
                 "size": t.get("size", "?"),
                 "source": "yts",
                 "age": "?",
-                "magnet": magnet_from_hash(t["hash"], m["title_long"]),
+                "magnet": magnet_from_hash(
+                    t["hash"], _clean_title(m.get("title_long") or m["title"])),
             })
     return out
 
@@ -167,11 +184,13 @@ def search_eztv(query):
         if not magnet:
             continue
         out.append({
-            "title": html.unescape(t.get("title", "?")),
-            "seeders": int(t.get("seeds", 0) or 0),
+            "title": _clean_title(t.get("title", "?")),
+            "seeders": _int(t.get("seeds")),
             "size": human_size(t.get("size_bytes", 0)),
             "source": "eztv",
-            "age": ago(t.get("date_based")),
+            # the API field is date_released_unix; date_based was never
+            # present and silently made every EZTV row "?"
+            "age": ago(t.get("date_released_unix") or t.get("date_based")),
             "magnet": magnet,
         })
     return out
@@ -182,14 +201,28 @@ def search_1337x(query):
     def try_host(host):
         page = http_get(f"https://{host}/search/{urllib.parse.quote(query)}/1/")
         results = []
-        # search page rows: capture link + name from the results table
-        for m in re.finditer(
-                r'href="/torrent/(\d+)/([^"/]+)/"[^>]*>([^<]+)</a>', page):
-            _id, slug, name = m.groups()
+        # one <tr> per result; the name cell also holds an icon-only anchor
+        # with the same href, so keep looking until an anchor has text
+        for row in re.split(r"<tr\b", page):
+            name = ""
+            for m in re.finditer(
+                    r'href="/torrent/(\d+)/([^"/]+)/"[^>]*>(.*?)</a>',
+                    row, re.S):
+                text = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+                if text:
+                    _id, slug, name = m.group(1), m.group(2), text
+                    break
+            if not name:
+                continue
+            seed = re.search(
+                r'class="[^"]*coll-2[^"]*"[^>]*>\s*([\d,]+)', row)
+            size = re.search(
+                r'class="[^"]*coll-4[^"]*"[^>]*>\s*([\d.]+\s*[KMGTP]?B)',
+                row)
             results.append({
-                "title": html.unescape(name.strip()),
-                "seeders": 0,
-                "size": "?",
+                "title": _clean_title(name),
+                "seeders": _int(seed.group(1)) if seed else 0,
+                "size": re.sub(r"\s+", "", size.group(1)) if size else "?",
                 "source": "1337x",
                 "age": "?",
                 "magnet": f"FETCH:https://{host}/torrent/{_id}/{slug}/",
@@ -218,8 +251,8 @@ def search_solidtorrents(query):
             continue
         magnet = t.get("magnet") or magnet_from_hash(t["info_hash_v1"], t["title"])
         out.append({
-            "title": t.get("title", "?"),
-            "seeders": int(t.get("seeders", 0) or 0),
+            "title": _clean_title(t.get("title", "?")),
+            "seeders": _int(t.get("seeders")),
             "size": t.get("size", "?"),
             "source": "solid",
             "age": ago(t.get("updatedAt")),
@@ -241,7 +274,10 @@ def search_nyaa(query):
         m = re.search(r'href="(magnet:\?[^"]+)"', row)
         sz = re.search(r'<td class="text-center">([\d.]+ [KMGTP]iB)</td>', row)
         ts = re.search(r'data-timestamp="(\d+)"', row)
-        seeds = re.findall(r'<td class="text-center">(\d+)</td>', row)
+        # the seeders cell carries the success color class, so a bare
+        # class="text-center" match (the size/downloads cells) never found it
+        seeds = re.search(
+            r'<td class="[^"]*text-success[^"]*"[^>]*>\s*([\d,]+)', row)
         mh = re.search(r'btih:([0-9A-Fa-f]{40})', row)
         if m:
             magnet = html.unescape(m.group(1))
@@ -250,8 +286,8 @@ def search_nyaa(query):
         else:
             continue
         out.append({
-            "title": html.unescape(t.group(1)),
-            "seeders": int(seeds[0]) if seeds else 0,
+            "title": _clean_title(t.group(1)),
+            "seeders": _int(seeds.group(1)) if seeds else 0,
             "size": sz.group(1).replace("iB", "B") if sz else "?",
             "source": "nyaa",
             "age": ago(ts.group(1)) if ts else "?",
@@ -271,8 +307,8 @@ def search_torlock(query):
             r'.*?<td[^>]*>(\d+)</td>', page, re.S):
         _id, _slug, name, size, seed = m.groups()
         out.append({
-            "title": html.unescape(name.strip()),
-            "seeders": int(seed),
+            "title": _clean_title(name),
+            "seeders": _int(seed),
             "size": size,
             "source": "torlock",
             "age": "?",
@@ -294,8 +330,8 @@ def search_torrentgalaxy(query):
             r'pen montbold text-success[^>]*>\s*<b[^>]*>([\d,]+)', rest)
         size = re.search(r'pen montbold[^>]*>\s*<b[^>]*>([\d.]+ [KMG]B)', rest)
         out.append({
-            "title": html.unescape(name.strip()),
-            "seeders": int((seed.group(1) if seed else "0").replace(",", "")),
+            "title": _clean_title(name),
+            "seeders": _int(seed.group(1)) if seed else 0,
             "size": size.group(1) if size else "?",
             "source": "tgx",
             "age": "?",
@@ -316,8 +352,8 @@ def search_limetorrents(query):
                 page, re.S):
             _id, _slug, name, size, seed = m.groups()
             out.append({
-                "title": html.unescape(name.strip()),
-                "seeders": int(seed),
+                "title": _clean_title(name),
+                "seeders": _int(seed),
                 "size": size,
                 "source": "lime",
                 "age": "?",
@@ -342,8 +378,8 @@ def search_knaben(query):
         tds = re.findall(r'<td[^>]*>(.*?)</td>', body, re.S)
         cell = lambda k: re.sub(r"<[^>]+>", " ", tds[k]).strip() if len(tds) > k else "?"
         out.append({
-            "title": html.unescape(t.group(1)),
-            "seeders": int(cell(4) or 0),
+            "title": _clean_title(t.group(1)),
+            "seeders": _int(cell(4)),
             "size": cell(2),
             "source": "knaben",
             "age": ago(time.mktime(time.strptime(cell(3), "%Y-%m-%d"))
@@ -359,13 +395,14 @@ def search_torrentscsv(query):
                      + urllib.parse.quote(query))
     out = []
     for t in data.get("torrents") or []:
+        title = _clean_title(t.get("name"))
         out.append({
-            "title": t.get("name", "?"),
-            "seeders": int(t.get("seeders", 0) or 0),
-            "size": human_size(t.get("size_bytes", 0)),
+            "title": title,
+            "seeders": _int(t.get("seeders")),
+            "size": human_size(_int(t.get("size_bytes"))),
             "source": "tcsv",
             "age": ago(t.get("created_unix")),
-            "magnet": magnet_from_hash(t["infohash"], t.get("name", "")),
+            "magnet": magnet_from_hash(t["infohash"], title),
         })
     return out
 
@@ -384,8 +421,8 @@ def search_torrentquest(query):
         seed = re.search(r'<td class="s">(\d+)</td>', row)
         age = re.search(r"<td>(\d+ [a-z]+(?: [a-z]+)?|\d+[hdmy])</td>", row)
         out.append({
-            "title": html.unescape(t.group(1)),
-            "seeders": int(seed.group(1)) if seed else 0,
+            "title": _clean_title(t.group(1)),
+            "seeders": _int(seed.group(1)) if seed else 0,
             "size": sz.group(1) if sz else "?",
             "source": "tq",
             "age": age.group(1) if age else "?",
@@ -411,8 +448,8 @@ def search_extratorrent(query):
         seed = re.search(r'<td class="sn">(\d+)</td>', row)
         age = re.search(r"<td>(\d+[hdmyw]|\d+ days|\d+ months|\d+ years)</td>", row)
         out.append({
-            "title": html.unescape(t.group(1)),
-            "seeders": int(seed.group(1)) if seed else 0,
+            "title": _clean_title(t.group(1)),
+            "seeders": _int(seed.group(1)) if seed else 0,
             "size": sz.group(1) if sz else "?",
             "source": "et",
             "age": age.group(1) if age else "?",
@@ -533,14 +570,18 @@ def main():
     results = sorted(seen.values(), key=lambda r: -r["seeders"])
 
     for i, r in enumerate(results):
+        title = r["title"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
         print("\t".join([
             str(i), str(r["seeders"]), r["size"], r["source"],
-            r["title"].replace("\t", " "), r.get("age", "?"), r["magnet"],
+            title, r.get("age", "?"), r["magnet"],
         ]))
 
+    # print errors even when other sources produced results: a caller with
+    # SAIL_DEBUG=1 needs to see the broken scraper, not just a short list.
+    # Normal searches discard this stream, so it costs nothing there.
+    for e in errors:
+        print(f"  [source error] {e}", file=sys.stderr)
     if not results:
-        for e in errors:
-            print(f"  [source error] {e}", file=sys.stderr)
         print("No results found.", file=sys.stderr)
 
 

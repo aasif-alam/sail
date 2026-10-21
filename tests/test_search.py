@@ -128,6 +128,98 @@ class SearchTorrentsCsvTest(unittest.TestCase):
         self.assertEqual(results[0]["seeders"], 7)
 
 
+class IntHelperTest(unittest.TestCase):
+    def test_parses_commas_and_junk(self):
+        self.assertEqual(search._int("1,234"), 1234)
+        self.assertEqual(search._int(" 7 "), 7)
+        self.assertEqual(search._int(None), 0)
+        self.assertEqual(search._int("n/a", -1), -1)
+
+
+class SearchEztvTest(unittest.TestCase):
+    @mock.patch("search.http_json")
+    def test_uses_date_released_unix(self, mock_json):
+        mock_json.return_value = {"torrents": [{
+            "title": "Show S01E01\n1080p",
+            "magnet_url": "magnet:?xt=urn:btih:H1",
+            "seeds": "5",
+            "size_bytes": "1234",
+            "date_released_unix": str(int(time.time() - 3 * 86400)),
+        }]}
+        results = search.search_eztv("show")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["age"], "3d ago")
+        self.assertEqual(results[0]["seeders"], 5)
+        self.assertNotIn("\n", results[0]["title"])
+
+
+class SearchNyaaTest(unittest.TestCase):
+    ROW = (
+        '<tr class="default">'
+        '<td class="text-center"><a href="/?c=1_2">Anime</a></td>'
+        '<td><a href="/view/123" title="[Subs] Show - 01 (1080p)">'
+        '[Subs] Show - 01 (1080p)</a></td>'
+        '<td class="text-center"><a href="magnet:?xt=urn:btih:'
+        'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&amp;dn=show">M</a></td>'
+        '<td class="text-center">1.4 GiB</td>'
+        '<td class="text-center" data-timestamp="1700000000">2023-11-14</td>'
+        '<td class="text-center text-success">42</td>'
+        '<td class="text-center text-danger">3</td>'
+        '<td class="text-center">100</td>'
+        '</tr>'
+    )
+
+    @mock.patch("search.http_get")
+    def test_reads_seeders_from_success_cell(self, mock_get):
+        mock_get.return_value = self.ROW
+        results = search.search_nyaa("show")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["seeders"], 42)
+        self.assertEqual(results[0]["size"], "1.4 GB")
+        self.assertEqual(results[0]["title"], "[Subs] Show - 01 (1080p)")
+        self.assertTrue(results[0]["magnet"].startswith("magnet:?xt=urn:btih:A"))
+
+
+class Search1337xTest(unittest.TestCase):
+    PAGE = """
+    <table><tbody>
+    <tr>
+      <td class="coll-1 name">
+        <a href="/torrent/123/some-show-s01e01/" class="icon"><span></span></a>
+        <a href="/torrent/123/some-show-s01e01/">Some Show <b>S01E01</b></a>
+      </td>
+      <td class="coll-2 seeds">1,234</td>
+      <td class="coll-3 leeches">2</td>
+      <td class="coll-4 size mob-avatar-warning">1.4 GB<span>1,234</span></td>
+    </tr>
+    </tbody></table>
+    """
+
+    @mock.patch("search.http_get")
+    def test_parses_seeders_and_size(self, mock_get):
+        mock_get.return_value = self.PAGE
+        results = search.search_1337x("some show")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["title"], "Some Show S01E01")
+        self.assertEqual(results[0]["seeders"], 1234)
+        self.assertEqual(results[0]["size"], "1.4GB")
+        self.assertTrue(results[0]["magnet"].startswith("FETCH:https://"))
+
+
+class SourceErrorOutputTest(unittest.TestCase):
+    def test_errors_print_even_when_other_results_exist(self):
+        import io
+
+        def boom(_query):
+            raise RuntimeError("kABOOM")
+
+        with mock.patch.object(search, "ALL_SOURCES", {"boom": boom}), \
+             mock.patch.object(sys, "argv", ["search.py", "--sources=boom", "x"]), \
+             mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            search.main()
+        self.assertIn("[source error] boom: kABOOM", err.getvalue())
+
+
 class LoadEnabledTest(unittest.TestCase):
     def test_missing_config_returns_defaults(self):
         with mock.patch.dict(os.environ, {"SAIL_SOURCES": "/nonexistent/path"}):
