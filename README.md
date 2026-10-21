@@ -12,6 +12,7 @@ Search, stream, and download torrents entirely from the macOS terminal.
 | `sail sources` | choose which sources every search uses |
 | `sail wlist [query]` | launch or manage the watchlist (save from results with ctrl-x) |
 | `sail --version` | print the installed version |
+| `sail -h` | show usage and exit |
 
 Downloads go to `~/Downloads/torrents` (override with `TORRENT_DOWNLOAD_DIR`).
 Set `SAIL_DEBUG=1` to see each source's own errors (timeouts, parse
@@ -61,9 +62,12 @@ Thirteen sources are built in. Pick and choose the ones every search uses:
 sail sources
 ```
 
-This opens a tick-list (tab toggles, enter saves). Your selection is stored in
-`~/.config/sail/sources.conf` — one source name per line — and applies
-globally. You can also edit that file by hand.
+This opens a tick-list. Type source numbers to toggle them (for example
+`1 3`), `a` turns all on, `x` turns all off, `s` saves, and `q` quits
+without saving. Your selection is stored in `~/.config/sail/sources.conf` —
+one source name per line — and applies globally. You can also edit that file
+by hand. A missing file means the six defaults; a file that exists is
+authoritative, so saving an empty list searches no sources.
 
 | Source | Focus | Method |
 |---|---|---|
@@ -153,9 +157,13 @@ cp completions/sail.bash "$(brew --prefix)/etc/bash_completion.d/sail"
 python3 -m unittest discover tests
 ```
 
-Tests mock all network calls — no live requests are made. A GitHub Actions
-workflow ([.github/workflows/ci.yml](.github/workflows/ci.yml)) runs them
-plus `shellcheck` on every push and PR.
+The Python tests mock every network call, so no live requests are made. The
+shell tests cover watchlist storage and its lock, the tmux-driven pickers,
+`wt.js` metadata and download cleanup, the sources UI, the download
+dashboard, CLI exit statuses, and installer cleanup. A GitHub Actions
+workflow ([.github/workflows/ci.yml](.github/workflows/ci.yml)) installs
+`webtorrent-cli` and runs the whole suite plus `shellcheck` on every push
+and PR.
 
 ## Notes
 
