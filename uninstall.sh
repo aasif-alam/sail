@@ -13,13 +13,15 @@ for link in /usr/local/bin/iina-cli "$HOME/.local/bin/iina-cli" \
 done
 
 # remove the PATH line install.sh appended to ~/.zshrc (and its marker) —
-# cat back into the file instead of mv'ing a temp over it so permissions stay
+# cat back into the file instead of mv'ing a temp over it so permissions stay.
+# awk (not grep -v) exits 0 even when every line is removed, so a read error
+# can never truncate the user's file.
 if [ -f "$HOME/.zshrc" ]; then
     tmp="$HOME/.zshrc.sail.$$"
-    # shellcheck disable=SC2016 # matching literal text, not an expression
-    grep -v -x -e '# sail: add ~/.local/bin to PATH (removed by uninstall.sh)' \
-               -e 'export PATH="$HOME/.local/bin:$PATH"' \
-               "$HOME/.zshrc" > "$tmp" || true
+    marker="# sail: add ~/.local/bin to PATH (removed by uninstall.sh)"
+    line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+    awk -v marker="$marker" -v line="$line" \
+        '$0 != marker && $0 != line' "$HOME/.zshrc" > "$tmp"
     cat "$tmp" > "$HOME/.zshrc"
     rm -f "$tmp"
 fi
