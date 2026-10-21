@@ -129,9 +129,17 @@ if [ "${1:-}" = "sources" ]; then
     python3 "$LIB_DIR/search.py" --list-sources > "$WORK/results"
 
     NAMES=(); DESCS=(); ON=()
-    while IFS=$'\t' read -r name desc; do
+    while IFS=$'\t' read -r name desc def; do
         NAMES+=("$name"); DESCS+=("$desc")
-        if [ -f "$CONF" ] && grep -qx "$name" "$CONF"; then ON+=(1); else ON+=(0); fi
+        if [ -f "$CONF" ]; then
+            # an existing file is authoritative — even an empty one, which
+            # means "search nothing" (the old fallback silently re-enabled
+            # the defaults while the UI showed every source as off)
+            if grep -qx "$name" "$CONF"; then ON+=(1); else ON+=(0); fi
+        else
+            # no file yet: show what a search will actually use
+            ON+=("${def:-0}")
+        fi
     done < "$WORK/results"
 
     DIRTY=0

@@ -144,16 +144,44 @@ class LoadEnabledTest(unittest.TestCase):
         finally:
             os.unlink(path)
 
-    def test_config_with_only_bogus_sources_falls_back_to_defaults(self):
+    def test_empty_config_means_no_sources(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}):
+                self.assertEqual(search.load_enabled(), [])
+        finally:
+            os.unlink(path)
+
+    def test_config_with_only_bogus_sources_is_empty(self):
         import tempfile
         with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
             f.write("not_a_real_source\n")
             path = f.name
         try:
             with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}):
-                self.assertEqual(search.load_enabled(), search.DEFAULT_ENABLED)
+                self.assertEqual(search.load_enabled(), [])
         finally:
             os.unlink(path)
+
+
+class ListSourcesTest(unittest.TestCase):
+    def test_third_column_marks_enabled_by_default(self):
+        import subprocess
+        out = subprocess.run(
+            [sys.executable,
+             os.path.join(os.path.dirname(__file__), "..", "lib", "search.py"),
+             "--list-sources"],
+            capture_output=True, text=True, check=True).stdout
+        rows = {}
+        for line in out.splitlines():
+            name, _desc, default = line.split("\t")
+            rows[name] = default
+        for name in search.DEFAULT_ENABLED:
+            self.assertEqual(rows[name], "1", name)
+        self.assertEqual(rows["1337x"], "0")
+        self.assertEqual(set(rows), set(search.ALL_SOURCES))
 
 
 class SourceInfoConsistencyTest(unittest.TestCase):

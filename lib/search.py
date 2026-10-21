@@ -459,7 +459,11 @@ def config_path():
 
 
 def load_enabled():
-    """Enabled source names, from the config file (all if it doesn't exist)."""
+    """Enabled source names, exactly as the config file lists them.
+
+    A missing file means DEFAULT_ENABLED. An existing file is authoritative
+    even when it is empty: that means search no sources (the UI writes an
+    empty file when the user saves with everything toggled off)."""
     path = config_path()
     if not os.path.exists(path):
         return list(DEFAULT_ENABLED)
@@ -471,7 +475,7 @@ def load_enabled():
                 continue
             if line in ALL_SOURCES:
                 enabled.append(line)
-    return enabled or list(DEFAULT_ENABLED)
+    return enabled
 
 
 def magnet_from_detail(url):
@@ -487,7 +491,8 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "--list-sources":
         for name in ALL_SOURCES:
-            print(f"{name}\t{SOURCE_INFO[name]}")
+            default = "1" if name in DEFAULT_ENABLED else "0"
+            print(f"{name}\t{SOURCE_INFO[name]}\t{default}")
         return
     if argv and argv[0].startswith("--sources="):
         enabled = [s for s in argv[0].split("=", 1)[1].split(",")
