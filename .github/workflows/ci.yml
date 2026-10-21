@@ -20,8 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: install webtorrent-cli
+        # homebrew, mirroring install.sh — `npm install -g` broke when the
+        # webtorrent dep ip-set@3 shipped a preinstall gate that hard-fails
+        # any npm install (only-allow pnpm). brew vendors the module tree so
+        # `command -v webtorrent` + walk-up discovery still finds it.
         run: |
-          npm install -g webtorrent-cli
+          brew install webtorrent-cli
           bash lib/fix-webtorrent.sh
       - name: run tests
         run: |

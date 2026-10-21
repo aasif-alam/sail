@@ -55,7 +55,9 @@ wlist_lock() {
 }
 
 wlist_unlock() {
-    [ -n "${WLIST_LOCK:-}" ] && rmdir "$WLIST_LOCK" 2>/dev/null || true
+    if [ -n "${WLIST_LOCK:-}" ]; then
+        rmdir "$WLIST_LOCK" 2>/dev/null || true
+    fi
     WLIST_LOCK=""
 }
 
