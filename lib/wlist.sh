@@ -16,7 +16,41 @@
 # — see the array-avoidance note in bin/sail's pick_video.
 
 wlist_file() {
-    printf '%s' "${SAIL_WLIST:-$HOME/.config/sail/wlist.tsv}"
+    local f="${SAIL_WLIST:-$HOME/.config/sail/wlist.tsv}"
+    if [ "$f" = "~" ]; then
+        f="$HOME"
+    elif [ "${f#\~/}" != "$f" ]; then
+        f="$HOME/${f#\~/}"
+    fi
+    printf '%s' "$f"
+}
+
+# Serialize writers: two terminals (or a save racing a remove) previously
+# rewrote the same file through the same .tmp.$$ name and could clobber each
+# other. mkdir is atomic on every filesystem sail supports. A lock left by a
+# crashed writer is stolen only after it is a minute old.
+wlist_lock() {
+    local f lock i=0
+    f="$(wlist_file)"
+    mkdir -p "$(dirname "$f")"
+    lock="$f.lock"
+    while ! mkdir "$lock" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge 50 ] \
+           && find "$lock" -maxdepth 0 -mmin +1 -print -quit 2>/dev/null \
+              | grep -q .; then
+            rmdir "$lock" 2>/dev/null || true
+            i=0
+            continue
+        fi
+        sleep 0.1
+    done
+    WLIST_LOCK="$lock"
+}
+
+wlist_unlock() {
+    [ -n "${WLIST_LOCK:-}" ] && rmdir "$WLIST_LOCK" 2>/dev/null || true
+    WLIST_LOCK=""
 }
 
 # btih info hash for dedup, extracted with bash's own regex — the dedup
@@ -54,7 +88,7 @@ wlist_add() {
     [ -n "$title" ] && [ -n "$magnet" ] || return 2
     _wlist_key_of "$magnet"; key="$WLIST_KEY"
     f="$(wlist_file)"
-    mkdir -p "$(dirname "$f")"
+    wlist_lock
     touch "$f"
     tmp="$f.tmp.$$"
     now="$(date +%s)"
@@ -76,6 +110,7 @@ wlist_add() {
         printf '%s\t%s\t%s\n' "$title" "$magnet" "$now"
     } > "$tmp"
     mv "$tmp" "$f"
+    wlist_unlock
     return "$found"
 }
 
@@ -86,7 +121,11 @@ wlist_remove() {
     [ -n "$1" ] || return 1
     _wlist_key_of "$1"; key="$WLIST_KEY"
     f="$(wlist_file)"
-    [ -f "$f" ] || return 1
+    wlist_lock
+    if [ ! -f "$f" ]; then
+        wlist_unlock
+        return 1
+    fi
     tmp="$f.tmp.$$"
     {
         while IFS=$'\t' read -r t m ts || [ -n "$t" ]; do
@@ -100,6 +139,7 @@ wlist_remove() {
         done < "$f"
     } > "$tmp"
     mv "$tmp" "$f"
+    wlist_unlock
     [ "$removed" -eq 1 ]
 }
 

@@ -122,5 +122,21 @@ fi
 rc=0; wlist_lookup "$W/rows.tsv" 99 >/dev/null 2>&1 || rc=$?
 [ "$rc" -ne 0 ] && ok "wlist_lookup bad id fails" || fail "wlist_lookup bad id"
 
+# 11. concurrent writers serialize on the lock instead of losing rows
+export SAIL_WLIST="$W/concurrent.tsv"
+for i in $(seq 1 8); do
+    (
+        . lib/wlist.sh
+        wlist_add "Concurrent $i" "$(printf 'magnet:?xt=urn:btih:%040d' "$i")"
+    ) &
+done
+wait || true
+if [ "$(wc -l < "$SAIL_WLIST" | tr -d ' ')" -eq 8 ] \
+   && [ ! -e "$SAIL_WLIST.lock" ]; then
+    ok "concurrent adds: all 8 rows survive, lock released"
+else
+    fail "concurrent adds: $(wc -l < "$SAIL_WLIST" 2>/dev/null | tr -d ' ') rows, lock=$([ -e "$SAIL_WLIST.lock" ] && echo left || echo gone)"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

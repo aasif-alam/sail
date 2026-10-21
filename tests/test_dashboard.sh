@@ -45,7 +45,7 @@ fi
 cat > "$W/case1.sh" <<'EOF'
 set -euo pipefail
 . "$1/stop_render.sh"
-WORK="$2"; mkdir -p "$WORK"
+WORK="$2"; mkdir -p "$WORK"; : > "$WORK/render.frame"
 DASH_H=15
 bash -c 'trap "" TERM; sleep 30' &
 RENDER_PID=$!
@@ -71,7 +71,7 @@ else
     fail "renderer still running"
 fi
 
-CLEARS="$(grep -o $'\033\[15A' "$W/out1" | wc -l | tr -d ' ')"
+CLEARS="$(grep -o $'\033\[15A' "$W/out1" | wc -l | tr -d ' ' || true)"
 if [ "$CLEARS" -eq 1 ]; then
     ok "exactly one dashboard clear"
 else
@@ -82,7 +82,7 @@ fi
 cat > "$W/case2.sh" <<'EOF'
 set -euo pipefail
 . "$1/stop_render.sh"
-WORK="$2"; mkdir -p "$WORK"
+WORK="$2"; mkdir -p "$WORK"; : > "$WORK/render.frame"
 DASH_H=15
 trap 'if [ -n "${RENDER_PID:-}" ]; then stop_render; fi' EXIT
 bash -c 'trap "" TERM; sleep 30' &
@@ -90,11 +90,29 @@ RENDER_PID=$!
 stop_render
 EOF
 bash "$W/case2.sh" "$W" "$W/work2" > "$W/out2" 2>"$W/stderr2" || true
-CLEARS="$(grep -o $'\033\[15A' "$W/out2" | wc -l | tr -d ' ')"
+CLEARS="$(grep -o $'\033\[15A' "$W/out2" | wc -l | tr -d ' ' || true)"
 if [ "$CLEARS" -eq 1 ]; then
     ok "explicit stop + trap clears once (no double erase)"
 else
     fail "explicit stop + trap cleared $CLEARS times"
+fi
+
+# --- 3. no frame drawn yet: don't erase unrelated output -------------------
+cat > "$W/case3.sh" <<'EOF'
+set -euo pipefail
+. "$1/stop_render.sh"
+WORK="$2"; mkdir -p "$WORK"
+DASH_H=15
+bash -c 'trap "" TERM; sleep 30' &
+RENDER_PID=$!
+stop_render > "$3"
+EOF
+bash "$W/case3.sh" "$W" "$W/work3" "$W/out3" > /dev/null 2>"$W/stderr3" || true
+CLEARS="$(grep -o $'\033\[15A' "$W/out3" | wc -l | tr -d ' ' || true)"
+if [ "$CLEARS" -eq 0 ] && grep -q $'\033\[?25h' "$W/out3"; then
+    ok "no frame drawn: cursor restored, nothing erased"
+else
+    fail "no frame drawn: clears=$CLEARS out=[$(cat "$W/out3")]"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

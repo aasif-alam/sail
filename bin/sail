@@ -8,6 +8,7 @@
 #   sail sources        choose which sources to search
 #   sail wlist [query]  launch or manage saved torrents (ctrl-x saves one)
 #   sail --version      print the version and exit
+#   sail -h             show this help
 #
 # SAIL_DEBUG=1 prints each source's stderr (timeouts, parse errors) after
 # a search instead of discarding it, and why a subtitle already inside a
@@ -26,8 +27,20 @@ else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
 
+# bash expands ~ only in word expansion, never in a variable's value — so
+# TORRENT_DOWNLOAD_DIR='~/Videos' would otherwise create a literal "~" dir
+expand_tilde() {
+    if [ "$1" = "~" ]; then
+        printf '%s' "$HOME"
+    elif [ "${1#\~/}" != "$1" ]; then
+        printf '%s/%s' "$HOME" "${1#\~/}"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 SAIL_VERSION="1.4.0"
-DOWNLOAD_DIR="${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}"
+DOWNLOAD_DIR="$(expand_tilde "${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}")"
 
 # SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
 # for a very long time on unreachable trackers
@@ -61,12 +74,17 @@ stop_render() {
     # wait returns 137 after that SIGKILL; without || true, set -e would
     # abort here — before the block is cleared and before callers print
     wait "$pid" 2>/dev/null || true
-    printf '\033[%dA\033[J\033[?25h' "${DASH_H:-15}"
+    if [ -f "$WORK/render.frame" ]; then
+        printf '\033[%dA\033[J' "${DASH_H:-15}"
+        rm -f "$WORK/render.frame"
+    fi
+    # restore the cursor even when the renderer died before its first frame
+    printf '\033[?25h'
 }
 
 usage() {
-    sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
-    exit 1
+    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+    exit "${1:-1}"
 }
 
 # best-effort macOS notification — never blocks or fails the caller
@@ -88,7 +106,7 @@ WORK="$(mktemp -d -t sail.XXXXXX)"
 # break the NEXT run with "address already in use") when destroy() hangs,
 # per the comment above stop_pid — WPID is the metadata-fetch process
 # (the wt.js meta invocation below), which runs well before WT_PID exists
-trap 'rm -rf "$WORK"; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; if [ -n "${RENDER_PID:-}" ]; then stop_render; fi; if [ "${STREAMING:-0}" = 1 ]; then rm -rf "${TMPDIR:-/tmp}/webtorrent"; fi' EXIT INT TERM
+trap 'if [ -n "${RENDER_PID:-}" ]; then stop_render; fi; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; rm -rf "$WORK"' EXIT INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
 # before this behavior existed (nothing writes here anymore, so after the
@@ -123,7 +141,7 @@ fi
 
 # ---- `sail sources` — choose which sources every search uses --------------
 if [ "${1:-}" = "sources" ]; then
-    CONF="${SAIL_SOURCES:-$HOME/.config/sail/sources.conf}"
+    CONF="$(expand_tilde "${SAIL_SOURCES:-$HOME/.config/sail/sources.conf}")"
     mkdir -p "$(dirname "$CONF")"
 
     python3 "$LIB_DIR/search.py" --list-sources > "$WORK/results"
@@ -317,6 +335,7 @@ if [ "${SKIP_SEARCH:-0}" != 1 ]; then
         case "$opt" in
             s) MODE="stream" ;;
             d) MODE="download" ;;
+            h) usage 0 ;;
             *) usage ;;
         esac
     done
@@ -324,6 +343,12 @@ if [ "${SKIP_SEARCH:-0}" != 1 ]; then
     [ $# -ge 1 ] || usage
 
     QUERY="$*"
+    # `sail ""` passed the arg count but searched for nothing; treat it as
+    # missing input rather than printing "no results for "
+    case "$QUERY" in
+        *[![:space:]]*) ;;
+        *) usage ;;
+    esac
 fi
 
 # braille spinner, shared by the search/meta phases and the live dashboard
@@ -426,8 +451,15 @@ fi
 
 if [[ "$MAGNET" == FETCH:* ]]; then
     printf '  resolving magnet link…\n'
-    MAGNET="$(python3 -c "import sys; sys.path.insert(0,'$LIB_DIR'); \
-        from search import magnet_from_detail; print(magnet_from_detail('${MAGNET#FETCH:}'))")"
+    # pass the URL as argv, not inside the script text: a quote in a scraped
+    # URL must not become Python syntax
+    MAGNET="$(python3 - "$LIB_DIR" "${MAGNET#FETCH:}" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from search import magnet_from_detail
+print(magnet_from_detail(sys.argv[2]))
+PY
+)"
 fi
 
 # options for the wt.js torrent runner: the magnet's trackers (the cached
@@ -502,6 +534,12 @@ mkdir -p "$DOWNLOAD_DIR"
 # picker/downloader anyway, which is where a missing file list sends them
 META=""
 
+# SAIL_META_WAIT is seconds. The spinner ticks twice a second, so compare
+# against seconds*2 — the old code compared the tick count directly,
+# silently halving the documented timeout.
+META_WAIT="${SAIL_META_WAIT:-300}"
+case "$META_WAIT" in ''|*[!0-9]*) META_WAIT=300 ;; esac
+
 printf '  reading torrent info '
 if [ -n "$WTMOD" ]; then
     for META_TRY in 1 2; do
@@ -510,11 +548,12 @@ if [ -n "$WTMOD" ]; then
         WPID=$!
         i=0
         while kill -0 "$WPID" 2>/dev/null; do
-            [ "$i" -ge "${SAIL_META_WAIT:-300}" ] && break
+            [ "$i" -ge $((META_WAIT * 2)) ] && break
             printf '%s%s%s\b' "$CYN" "${SPIN[$((i % 10))]}" "$RST"
             i=$((i + 1)); sleep 0.5
         done
         stop_pid "$WPID"
+        WPID=""
         printf '\r%*s\r' 80 ''
         if [ -s "$WORK/files.tsv" ]; then
             META="$(find "$WORK" -maxdepth 1 -name '*.torrent' -print -quit)"
@@ -696,6 +735,9 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
         fi
 
         [ "$i" -gt 0 ] && printf '\033[%dA' "$DASH_H"
+        # stop_render only erases a block that actually started: killing the
+        # renderer before its first frame must not wipe unrelated output
+        : > "$WORK/render.frame"
         filled=$(( pct * BAR_W / 100 )); empty=$(( BAR_W - filled ))
         # built char-by-char in bash, not via `tr`: `tr` mangles multi-byte
         # UTF-8 under the C locale (the common default when a shell has no
@@ -724,8 +766,16 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
             "$CYN" "$(spark "$hist")" "$RST" "$DIM" "$peak" "$RST"
         printf '  %speers%s %s%s%s / %s%s known%s\033[K\n' \
             "$BLD" "$RST" "$pc" "$peers" "$RST" "$DIM" "$known" "$RST"
-        printf '  %s%-21s %-16s %10s %10s  %7s%s\033[K\n' \
-            "$DIM" ip client down up have% "$RST"
+        if [ "$tw" -ge 90 ]; then
+            printf '  %s%-21s %-16s %9s %9s  %6s%s\033[K\n' \
+                "$DIM" ip client down up have% "$RST"
+        elif [ "$tw" -ge 60 ]; then
+            printf '  %s%-18s %9s %9s  %6s%s\033[K\n' \
+                "$DIM" ip down up have% "$RST"
+        else
+            printf '  %s%9s %9s  %6s%s\033[K\n' \
+                "$DIM" down up have% "$RST"
+        fi
         slot=0
         if [ -n "$peerline" ]; then
             while IFS= read -r p; do
@@ -739,8 +789,16 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
                 if [ "$hv" -ge 100 ]; then hc="$GRN"
                 elif [ "$hv" -gt 0 ]; then hc="$YLW"
                 else hc="$DIM"; fi
-                printf '  %-21s %s%-16s%s %10s %10s  %s%7s%s\033[K\n' \
-                    "${addr:0:21}" "$DIM" "$(cutw "$client" 16)" "$RST" "$d" "$u" "$hc" "$have" "$RST"
+                if [ "$tw" -ge 90 ]; then
+                    printf '  %-21s %s%-16s%s %9s %9s  %s%6s%s\033[K\n' \
+                        "$(cutw "$addr" 21)" "$DIM" "$(cutw "$client" 16)" "$RST" "$d" "$u" "$hc" "$have" "$RST"
+                elif [ "$tw" -ge 60 ]; then
+                    printf '  %-18s %9s %9s  %s%6s%s\033[K\n' \
+                        "$(cutw "$addr" 18)" "$d" "$u" "$hc" "$have" "$RST"
+                else
+                    printf '  %9s %9s  %s%6s%s\033[K\n' \
+                        "$d" "$u" "$hc" "$have" "$RST"
+                fi
             done <<< "$(printf '%s' "$peerline" | sed $'s/^PEERS\t//' | tr ';' '\n')"
         fi
         if [ "$slot" -eq 0 ] && [ "$peers" -eq 0 ]; then
@@ -774,7 +832,6 @@ if [ "$MODE" = "stream" ]; then
 
     FALLBACK_STREAM() {
         printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
-        STREAMING=1
         webtorrent "$MAGNET" "--$PLAYER" -i
         exit $?
     }
@@ -868,7 +925,6 @@ if [ "$MODE" = "stream" ]; then
     node "$LIB_DIR/wt.js" "$WTMOD" serve "$META" "$WORK/stream" \
         "$SERVE_SEL" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
     WT_PID=$!
-    STREAMING=1
     # the runner prints PORT=<n> once listening (falls back to any free port
     # if our requested one was taken); verify it actually serves http
     for i in $(seq 1 40); do
@@ -943,8 +999,11 @@ if [ "$MODE" = "stream" ]; then
 else
     FALLBACK_DOWNLOAD() {
         printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
-        STREAMING=1
-        exec webtorrent "$MAGNET" --out "$DOWNLOAD_DIR" -i
+        # foreground, not exec: exec would replace the shell and skip the
+        # EXIT trap (temp dir cleanup, renderer/server teardown)
+        local rc=0
+        webtorrent "$MAGNET" --out "$DOWNLOAD_DIR" -i || rc=$?
+        exit "$rc"
     }
 
     # can't read the torrent's file list, no video files found, or no
@@ -971,11 +1030,11 @@ else
     node "$LIB_DIR/wt.js" "$WTMOD" get "$META" "$DOWNLOAD_DIR" \
         "$SEL_IDXS" "$OPTS_JSON" >"$WORK/wt.log" 2>&1 &
     WT_PID=$!
-    STREAMING=1
     render_status "DOWNLOADING" "$N_SEL file$([ "$N_SEL" = 1 ] || printf s) to $DOWNLOAD_DIR" "$SEL_TITLE" &
     RENDER_PID=$!
     WT_STATUS=0
     wait "$WT_PID" || WT_STATUS=$?
+    WT_PID=""
     stop_render
     ELAPSED="$((SECONDS / 3600))h$(printf '%02d' $((SECONDS % 3600 / 60)))m"
     [ "$SECONDS" -lt 3600 ] && ELAPSED="$((SECONDS / 60))m$(printf '%02d' $((SECONDS % 60)))s"
