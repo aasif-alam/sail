@@ -63,11 +63,12 @@ if [ ! -x /Applications/IINA.app/Contents/MacOS/iina ] \
     brew install --cask iina || err "IINA install failed — install mpv manually: brew install mpv"
 fi
 
-# Put IINA's CLI on PATH so webtorrent can launch it for streaming
-if [ -x /Applications/IINA.app/Contents/MacOS/iina ]; then
+# Put IINA's CLI helper on PATH — bin/sail launches iina-cli (the plain
+# iina binary does not accept --keep-running/--mpv-sub-files)
+if [ -x /Applications/IINA.app/Contents/MacOS/iina-cli ]; then
     LINK_DIR="/usr/local/bin"
-    [ -w "$LINK_DIR" ] && ln -sf /Applications/IINA.app/Contents/MacOS/iina "$LINK_DIR/iina" 2>/dev/null \
-        || { mkdir -p "$HOME/.local/bin" && ln -sf /Applications/IINA.app/Contents/MacOS/iina "$HOME/.local/bin/iina" 2>/dev/null; } || true
+    [ -w "$LINK_DIR" ] && ln -sf /Applications/IINA.app/Contents/MacOS/iina-cli "$LINK_DIR/iina-cli" 2>/dev/null \
+        || { mkdir -p "$HOME/.local/bin" && ln -sf /Applications/IINA.app/Contents/MacOS/iina-cli "$HOME/.local/bin/iina-cli" 2>/dev/null; } || true
 fi
 
 # ---- Install the command -------------------------------------------------
@@ -80,7 +81,12 @@ if [ ! -w "$BIN_DIR" ]; then
     # shellcheck disable=SC2016
     case ":$PATH:" in
         *":$BIN_DIR:"*) ;;
-        *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+        *) if ! grep -qxF 'export PATH="$HOME/.local/bin:$PATH"' "$HOME/.zshrc" 2>/dev/null; then
+               {
+                   echo '# sail: add ~/.local/bin to PATH (removed by uninstall.sh)'
+                   echo 'export PATH="$HOME/.local/bin:$PATH"'
+               } >> "$HOME/.zshrc"
+           fi
            say "Added $BIN_DIR to PATH (restart your terminal or run: source ~/.zshrc)" ;;
     esac
 fi
@@ -112,7 +118,9 @@ say "Verifying installation…"
 for cmd in fzf webtorrent python3; do
     command -v "$cmd" >/dev/null 2>&1 || err "$cmd not found after install."
 done
-command -v iina >/dev/null 2>&1 || command -v mpv >/dev/null 2>&1 || \
-    say "Note: iina/mpv not on PATH — IINA app is installed; streaming will still work."
+command -v iina-cli >/dev/null 2>&1 \
+    || [ -x /Applications/IINA.app/Contents/MacOS/iina-cli ] \
+    || command -v mpv >/dev/null 2>&1 \
+    || say "Note: no iina-cli or mpv found — streaming needs one of them."
 
 printf '\n%sDone!%s Try it with:\n\n    sail ubuntu\n\n' "$GRN" "$RST"
