@@ -159,7 +159,7 @@ if [ "${1:-}" = "sources" ]; then
         while IFS= read -r ln; do
             vis="$(printf '%s' "$ln" | sed $'s/\x1b\\[[0-9;]*m//g' \
                 | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')"
-            pad=$((ROWW + 10 - vis))
+            pad=$((ROWW + 12 - vis))
             [ "$pad" -ge 0 ] || pad=0
             printf '  │ %s%*s│\n' "$ln" "$pad" ""
         done <<< "$1"

@@ -98,5 +98,19 @@ else
     fail "toggle tpb off: file=[$(tr '\n' ',' < "$CONF" 2>/dev/null)]"
 fi
 
+# --- 6. every box line has the same display width --------------------------
+rm -f "$CONF"
+OUT="$(run_ui "$CONF" q)"
+PLAIN="$(printf '%s\n' "$OUT" | strip)"
+WIDTHS="$(printf '%s\n' "$PLAIN" | grep -E '^  [│╭╰]' \
+    | while IFS= read -r line; do
+          printf '%s' "$line" | LC_ALL=en_US.UTF-8 wc -m | tr -d ' '
+      done | sort -u)"
+if [ "$(printf '%s\n' "$WIDTHS" | grep -c . || true)" -eq 1 ]; then
+    ok "box borders and content share one width ($WIDTHS)"
+else
+    fail "box line widths differ: $(printf '%s' "$WIDTHS" | tr '\n' ' ')"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
