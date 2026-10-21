@@ -30,7 +30,7 @@ else
 fi
 
 OUT="$W/downloads"
-mkdir -p "$OUT/Season 1"
+mkdir -p "$OUT/Season 1" "$OUT/Empty Pre"
 printf 'earlier download\n' > "$OUT/Season 1/preexisting.bin"
 printf 'selected this run\n' > "$OUT/Season 1/selected.bin"
 
@@ -47,12 +47,14 @@ const pre = snapshotPaths(out)
 fs.writeFileSync(path.join(out, 'Season 1', 'fragment.bin'), 'junk')
 fs.mkdirSync(path.join(out, 'Season 2'))
 fs.writeFileSync(path.join(out, 'Season 2', 'ep2.bin'), 'junk')
+fs.writeFileSync(path.join(out, 'Empty Pre', 'frag.bin'), 'junk')
 
 cleanupUnselected([
   { path: 'Season 1/preexisting.bin' },  // 0: unselected but pre-existing
   { path: 'Season 1/selected.bin' },     // 1: selected
   { path: 'Season 1/fragment.bin' },     // 2: unselected fragment (new)
-  { path: 'Season 2/ep2.bin' }           // 3: unselected fragment (new)
+  { path: 'Season 2/ep2.bin' },          // 3: unselected fragment (new)
+  { path: 'Empty Pre/frag.bin' }         // 4: new file in pre-existing dir
 ], out, [1], pre)
 JS
 
@@ -79,6 +81,12 @@ if [ ! -e "$OUT/Season 2" ]; then
     ok "empty fragment directory removed"
 else
     fail "empty fragment directory left behind"
+fi
+
+if [ -d "$OUT/Empty Pre" ] && [ ! -e "$OUT/Empty Pre/frag.bin" ]; then
+    ok "pre-existing empty directory survives fragment cleanup"
+else
+    fail "pre-existing directory was removed with its fragment"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
