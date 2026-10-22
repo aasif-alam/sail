@@ -17,6 +17,10 @@ UTF8_LOCALE="${UTF8_LOCALE:-en_US.UTF-8}"
 if [ -z "${SPIN+x}" ]; then
     SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 fi
+# partial-block ramp for the progress bar's trailing cell (▏ is 1/8 of a
+# cell wide … ▉ is 7/8; index = eighths of the current cell). dashboard.sh
+# is sourced standalone by its tests, so it owns its copy.
+PARTS=('' ▏ ▎ ▍ ▌ ▋ ▊ ▉)
 
 # stop the dashboard renderer and clear its block. TERM first (it's usually
 # mid-sleep, and bash only runs its cleanup trap once sleep returns), a
@@ -87,18 +91,20 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
     local i=0 line peerline peers pct down total speed up upl eta ratio known
     local filled empty k chunk bar pc hist kb addr client d u have slot el
     local tw=118 peak hv hc rows slots last
+    local ew rem dash_n dashfill tail_n tailfill
     SECONDS=0
-    # fit the peer table to the terminal: 9 fixed lines above it, so a
-    # short window loses peer rows instead of scrolling the dashboard
+    # fit the peer table to the terminal: 10 fixed lines around it (top rule,
+    # 8 content rows, peer header, bottom rule), so a short window loses peer
+    # rows instead of scrolling the dashboard
     rows="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f1 || true)"
     slots=6
     case "$rows" in
         ''|*[!0-9]*) ;;
-        *) slots=$((rows - 9))
+        *) slots=$((rows - 10))
            [ "$slots" -gt 6 ] && slots=6
            [ "$slots" -lt 1 ] && slots=1 ;;
     esac
-    DASH_H=$((9 + slots))
+    DASH_H=$((10 + slots))
     # stop_render quotes this back when erasing, so a resized window that
     # trimmed peer rows still clears exactly what was drawn
     printf '%s\n' "$DASH_H" > "$WORK/render.h"
@@ -148,12 +154,20 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
         # stop_render only erases a block that actually started: killing the
         # renderer before its first frame must not wipe unrelated output
         : > "$WORK/render.frame"
-        filled=$(( pct * BAR_W / 100 )); empty=$(( BAR_W - filled ))
+        # eighth-cell progress: pct scaled to BAR_W*8 so the remainder picks
+        # a partial-block char — the bar moves in 1/8-cell steps instead of
+        # 3.3% jumps, at the same width, from the same █░ family
+        ew=$(( pct * BAR_W * 8 / 100 ))
+        filled=$(( ew / 8 )); rem=$(( ew % 8 )); empty=$(( BAR_W - filled ))
         # built char-by-char in bash, not via `tr`: `tr` mangles multi-byte
         # UTF-8 under the C locale (the common default when a shell has no
         # LANG/LC_ALL set), turning the block characters into invalid garbage
         chunk=""; for ((k = 0; k < filled; k++)); do chunk+="█"; done
         bar="${GRN}${chunk}"
+        if [ "$rem" -gt 0 ]; then
+            bar+="${GRN}${PARTS[$((rem))]}"
+            empty=$(( empty - 1 ))
+        fi
         chunk=""; for ((k = 0; k < empty; k++)); do chunk+="░"; done
         bar+="${DIM}${chunk}${RST}"
         if [ "$peers" -eq 0 ]; then pc="$RED"
@@ -163,8 +177,19 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
         el="$((SECONDS / 3600))h$(printf '%02d' $((SECONDS % 3600 / 60)))m"
         [ "$SECONDS" -lt 3600 ] && el="$((SECONDS / 60))m$(printf '%02d' $((SECONDS % 60)))s"
 
-        printf '%s%s%s  %s%s%s  %st %s%s\033[K\n' \
-            "$CYN" "${SPIN[$((i % 10))]}" "$RST" "$BLD" "$mode" "$RST" "$DIM" "$el" "$RST"
+        # torn-open frame ─ a top rule carrying mode + elapsed reads the
+        # block as one object; the ╰ tail closes it. Both spans keep to
+        # ASCII/box glyphs, so no wide-cell measuring is needed for the
+        # edges (titles stay on their own lines inside)
+        dash_n=$(( tw - 15 - ${#mode} ))
+        [ "$dash_n" -lt 1 ] && dash_n=1
+        printf -v dashfill '─%.0s' $(seq 1 "$dash_n")
+        tail_n=$(( tw - 1 ))
+        [ "$tail_n" -lt 1 ] && tail_n=1
+        printf -v tailfill '─%.0s' $(seq 1 "$tail_n")
+        printf '  ╭─ %s%s%s %s%s%s %s· %s ─%s\033[K\n' \
+            "$CYN" "${SPIN[$((i % 10))]}" "$RST" \
+            "$BLD" "$mode" "$RST" "$DIM" "$el" "$dashfill$RST"
         printf '  %s%s%s\033[K\n' "$BLD" "$(cutw "$title" "$tw")" "$RST"
         printf '  %s%s%s\033[K\n' "$DIM" "$(cutw "$what" "$tw")" "$RST"
         printf '  %s  %s%3s%%%s\033[K\n' "$bar" "$BLD" "$pct" "$RST"
@@ -220,6 +245,7 @@ render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = tor
             slot=$((slot + 1))
             printf '\033[K\n'
         done
+        printf '  %s╰%s%s\033[K\n' "$DIM" "$tailfill" "$RST"
         i=$((i + 1))
         sleep 0.5
     done

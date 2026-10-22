@@ -55,12 +55,16 @@ sail_sources_ui() {
     }
 
     draw() {
-        local i
+        local i en=0
+        for i in "${!NAMES[@]}"; do
+            [ "${ON[$i]}" = 1 ] && en=$((en + 1))
+        done
         printf '\033[H\033[2J'
         printf '  ╭─'
         for ((i = 0; i < ROWW + 12; i++)); do printf '─'; done
         printf '╮\n'
-        boxline "$(printf '%ssources%s — used by every search' "$BLD" "$RST")"
+        boxline "$(printf '%ssources%s — used by every search %s%d/%d enabled%s' \
+            "$BLD" "$RST" "$DIM" "$en" "${#NAMES[@]}" "$RST")"
         boxline ""
         for i in "${!NAMES[@]}"; do
             if [ "${ON[$i]}" = 1 ]; then

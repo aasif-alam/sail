@@ -76,11 +76,12 @@ pick_video() {
     # a plain string, not an array: bash 3.2 (macOS's stock /bin/bash) throws
     # "unbound variable" under `set -u` when expanding an empty array with
     # "${arr[@]}" — an empty scalar string has no such problem
-    local sorted common_dir fzf_extra="" \
-        header="size      ep      file"$'\n'"  enter: play   esc: cancel"
+    local sorted common_dir fzf_extra="" header
     if [ "${2:-}" = "multi" ]; then
         fzf_extra="--multi --bind ctrl-a:select-all,ctrl-d:deselect-all"
-        header="size      ep      file"$'\n'"  tab toggles · ctrl-a all · ctrl-d none · enter confirms"
+        header="size      ep      file"$'\n'"${DIM}$(printf '─%.0s' $(seq 1 48))${RST}"$'\n'"  tab toggles · ctrl-a all · ctrl-d none · enter confirms"
+    else
+        header="size      ep      file"$'\n'"${DIM}$(printf '─%.0s' $(seq 1 48))${RST}"$'\n'"  enter: play   esc: cancel"
     fi
     # sort by path, not raw torrent-file index: scene releases zero-pad
     # episode numbers (S01E01, S01E10, ...), so alphabetical order is

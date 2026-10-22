@@ -39,7 +39,7 @@ sail_wlist_ui() {
         OUT="$(printf '%s\n' "$ROWS" | fzf --ansi --expect=ctrl-x \
               --delimiter='\t' --with-nth=2,3 \
               --query="$WQUERY" \
-              --header="saved     title"$'\n'"  enter: launch   ctrl-x: remove   esc: quit$NOTICE" \
+              --header="saved     title"$'\n'"${DIM}$(printf '─%.0s' $(seq 1 48))${RST}"$'\n'"  enter: launch   ctrl-x: remove   esc: quit$NOTICE" \
               --header-first --reverse --height=90% --tabstop=1 \
               --border=rounded --margin=1,2)" || return 1
         PICK_KEY="${OUT%%$'\n'*}"

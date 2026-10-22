@@ -23,9 +23,20 @@ set -euo pipefail
 
 # ---------- palette (plain when not attached to a terminal or NO_COLOR is
 # set — https://no-color.org; layout glyphs like the progress bar stay) ------
+# On 256-color terminals the semantic slots get gentler hues (soft cyan,
+# amber warnings, a calmer red/green) than the default VGA set; on older
+# TERM values, plain SSH, or dumb multiplexers the plain ANSI codes stay.
+# Same slots, same meaning — the upgrade is invisible to everything that
+# only knows 16 colors.
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
-    BLD=$'\e[1m'; DIM=$'\e[2m'
-    RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; CYN=$'\e[36m'; RST=$'\e[0m'
+    BLD=$'\e[1m'; DIM=$'\e[2m'; RST=$'\e[0m'
+    case "${TERM:-}${COLORTERM:-}" in
+        *256color*|*truecolor*|*24bit*|*direct*|*ghostty*|*kitty*)
+            RED=$'\e[38;5;203m'; GRN=$'\e[38;5;114m'; YLW=$'\e[38;5;215m' \
+            CYN=$'\e[38;5;81m' ;;
+        *)
+            RED=$'\e[31m'; GRN=$'\e[32m'; YLW=$'\e[33m'; CYN=$'\e[36m' ;;
+    esac
 else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
@@ -151,6 +162,7 @@ cleanup() {
     [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"
     [ -n "${WPID:-}" ] && stop_pid "$WPID"
     [ -n "${SEARCH_PID:-}" ] && stop_pid "$SEARCH_PID"
+    [ -n "${RESOLVE_PID:-}" ] && stop_pid "$RESOLVE_PID"
     rm -rf "$WORK"
     return 0
 }
@@ -372,9 +384,17 @@ sorted_results() {
     esac
 }
 
-# print results as a plain table (no picker) — for `sail -l`
+# print results as a plain table (no picker) — for `sail -l`. The seed count
+# gets the picker's thresholds; the palette is empty on a pipe, so this
+# degrades to the same plain rows stream consumers see today.
 list_results() {
-    awk -F'\t' '{ printf "%6s  %-9s %-6s %s\n", $2, $3, $4, $5 }' "$1"
+    awk -F'\t' -v R="$RST" -v G="$GRN" -v Y="$YLW" -v Rd="$RED" '{
+        seed = $2 + 0
+        if (seed >= 50)      sc = G
+        else if (seed >= 10) sc = Y
+        else                 sc = Rd
+        printf "%s%6s%s  %-9s %-6s %s\n", sc, $2, R, $3, $4, $5
+    }' "$1"
 }
 
 sort_label() {
@@ -406,7 +426,7 @@ search_and_pick() {
     fi
 
     n_results=$(wc -l < "$WORK/results" | tr -d ' ')
-    printf '  %s%s results%s\n\n' "$BLD" "$n_results" "$RST" >&2
+    printf '  %s✓ %s results%s\n\n' "$GRN" "$n_results" "$RST" >&2
 
     # ---- 2. pick a torrent — ctrl-x saves one, ctrl-t re-sorts ------------
     # --expect makes fzf print the pressed key ahead of the selection, which
@@ -414,7 +434,11 @@ search_and_pick() {
     # the list after a save, so several torrents can be watchlisted in one
     # pass (cmd+x would read better but terminals swallow it for their Edit
     # menu — CLI apps never see it)
-    local NOTICE="" SORT_MODE="seed" OUT PICK_KEY LINE
+    local NOTICE="" SORT_MODE="seed" OUT PICK_KEY LINE HEADER_RULE
+    # a dim rule between the column names and the hints turns the header
+    # into a header — one change, reused by every fzf screen in sail
+    printf -v HEADER_RULE '─%.0s' $(seq 1 64)
+    HEADER_RULE="${DIM}${HEADER_RULE}${RST}"
     while :; do
         # rows are tab-delimited so fzf can hide the internal row id from the
         # display (--with-nth) while the selection still carries it in field
@@ -432,11 +456,11 @@ search_and_pick() {
             else                 sc = Rd
             agecol = ""
             if (age != "?") agecol = sprintf("%s  (%s)%s", D, age, R)
-            printf "%s\t%s%-5s%s\t%-9s\t%-6s\t%s%s%s\t%s\n", \
-                id, sc, seed, R, size, src, B, title, R, agecol
+            printf "%s\t%s%-5s%s\t%-9s\t%s%-6s%s\t%s%s%s\t%s\n", \
+                id, sc, seed, R, size, D, src, R, B, title, R, agecol
         }' | fzf --ansi --expect=ctrl-x,ctrl-t \
               --delimiter='\t' --with-nth=2,3,4,5,6 \
-              --header="seed  size      source title"$'\n'"  enter: select   ctrl-x: watchlist   ctrl-t: sort ($(sort_label "$SORT_MODE"))   esc: cancel$NOTICE" \
+              --header="seed  size      source title"$'\n'"$HEADER_RULE"$'\n'"  enter: select   ctrl-x: watchlist   ctrl-t: sort ($(sort_label "$SORT_MODE"))   esc: cancel$NOTICE" \
               --header-first --reverse --height=90% --tabstop=1 \
               --border=rounded --margin=1,2)" || exit 0
         PICK_KEY="${OUT%%$'\n'*}"
@@ -546,9 +570,28 @@ fi
 
 # ---- resolve a scraped detail-page URL ------------------------------------
 if [[ "$MAGNET" == FETCH:* ]]; then
-    printf '  resolving magnet link…\n'
-    if RESOLVED="$(resolve_magnet "${MAGNET#FETCH:}")"; then
-        MAGNET="$RESOLVED"
+    # resolve in the background with the search-phase spinner on stderr —
+    # a slow detail page should never read as a hung prompt
+    printf '  resolving magnet link ' >&2
+    RESOLVED=""
+    RESOLVE_RC=1
+    i=0
+    if [ -t 2 ]; then
+        resolve_magnet "${MAGNET#FETCH:}" > "$WORK/resolve.out" &
+    else
+        resolve_magnet "${MAGNET#FETCH:}" > "$WORK/resolve.out" 2>/dev/null &
+    fi
+    RESOLVE_PID=$!
+    while kill -0 "$RESOLVE_PID" 2>/dev/null; do
+        [ -t 2 ] && printf '%s%s%s\b' "$CYN" "${SPIN[$((i % 10))]}" "$RST" >&2
+        i=$(((i + 1) % 10 ))
+        sleep 0.25
+    done
+    wait "$RESOLVE_PID" || RESOLVE_RC=$?
+    RESOLVE_PID=""
+    [ -t 2 ] && clear_line >&2
+    if [ "$RESOLVE_RC" = 0 ] && [ -s "$WORK/resolve.out" ]; then
+        MAGNET="$(cat "$WORK/resolve.out")"
     else
         printf '  %scouldn'"'"'t resolve the magnet link%s — the source page is unavailable\n' \
             "$RED" "$RST" >&2
