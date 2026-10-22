@@ -53,7 +53,8 @@ done
 SELF="${BASH_SOURCE[0]:-}"
 SELF_DIR=""
 if [ -n "$SELF" ]; then
-    SELF_DIR="$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd || true)"
+    SELF_DIR="$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd)" \
+        || SELF_DIR=""
 fi
 if [ -z "$SELF_DIR" ] || [ ! -f "$SELF_DIR/bin/sail" ]; then
     REF="${SAIL_REF:-main}"
@@ -80,8 +81,9 @@ if [ -z "$SELF_DIR" ] || [ ! -f "$SELF_DIR/bin/sail" ]; then
     tar -tzf "$TARBALL" > "$TMP/archive.list" 2>/dev/null \
         || err "downloaded archive is not a valid tarball."
     TOP="$(awk 'NR == 1 { sub(/\/.*/, ""); print; exit }' "$TMP/archive.list")"
-    [ -n "$TOP" ] && [ -f "$TMP/$TOP/install.sh" ] \
-        || err "unexpected archive layout (no $TOP/install.sh)"
+    if [ -z "$TOP" ] || [ ! -f "$TMP/$TOP/install.sh" ]; then
+        err "unexpected archive layout (no $TOP/install.sh)"
+    fi
     tar -xzf "$TARBALL" -C "$TMP"
     ( trap 'rm -rf "$TMP"' EXIT; bash "$TMP/$TOP/install.sh" "$@" )
     exit $?
@@ -228,7 +230,9 @@ else
         err "could not move the old install aside."
     fi
     if ! mv "$STAGE" "$PKG_HOME"; then
-        [ -e "$OLD" ] && mv "$OLD" "$PKG_HOME" 2>/dev/null || true
+        if [ -e "$OLD" ]; then
+            mv "$OLD" "$PKG_HOME" 2>/dev/null || true
+        fi
         rm -rf "$STAGE"
         err "could not install to $PKG_HOME."
     fi

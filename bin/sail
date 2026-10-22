@@ -145,7 +145,7 @@ WORK="$(mktemp -d -t sail.XXXXXX)"
 # break the NEXT run with "address already in use") when destroy() hangs.
 # Signals exit explicitly: the old shared EXIT/INT trap cleaned up and then
 # let the script keep running against a deleted temp dir.
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
+# shellcheck disable=SC2329,SC2317  # invoked only by the traps below
 cleanup() {
     if [ -n "${RENDER_PID:-}" ]; then stop_render; fi
     [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"
@@ -154,7 +154,7 @@ cleanup() {
     rm -rf "$WORK"
     return 0
 }
-# shellcheck disable=SC2329  # invoked by the INT/TERM trap below
+# shellcheck disable=SC2329,SC2317  # invoked only by the traps below
 on_signal() {
     trap - EXIT
     cleanup

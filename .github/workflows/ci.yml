@@ -53,7 +53,7 @@ jobs:
         # any npm install (only-allow pnpm). brew vendors the module tree so
         # `command -v webtorrent` + walk-up discovery still finds it.
         run: |
-          brew install tmux webtorrent-cli
+          brew install tmux fzf webtorrent-cli
           bash lib/fix-webtorrent.sh
       - name: run tests
         env:

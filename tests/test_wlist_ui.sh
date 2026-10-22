@@ -2,21 +2,23 @@
 # Interactive UI tests for the watchlist — drives the real fzf interface
 # through tmux. A plain pty isn't enough: fzf stalls waiting for terminal
 # cursor-position reports no dumb pty answers (fzf's own CI uses tmux for
-# the same reason). Skips cleanly when tmux isn't installed.
+# the same reason). Skips cleanly when tmux or fzf isn't installed.
 #
 # Storage-layer tests live in test_wlist.sh; this file covers what only a
 # terminal can prove: the picker renders, enter launches, ctrl-x removes,
 # and the search picker's ctrl-x saves.
 set -euo pipefail
 
-if ! command -v tmux >/dev/null 2>&1; then
-    if [ -n "${CI:-}" ]; then
-        printf 'tmux not installed — CI requires it\n' >&2
-        exit 1
+for dep in tmux fzf; do
+    if ! command -v "$dep" >/dev/null 2>&1; then
+        if [ -n "${CI:-}" ]; then
+            printf '%s not installed — CI requires it\n' "$dep" >&2
+            exit 1
+        fi
+        printf 'skip: %s not installed\n' "$dep"
+        exit 0
     fi
-    printf 'skip: tmux not installed\n'
-    exit 0
-fi
+done
 
 cd "$(dirname "$0")/.."
 
@@ -51,7 +53,11 @@ Old One	magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=old	1760
 New Two	magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=new	1760100000
 T
 run "$W/w1"
-if pane | grep -q "enter: launch"; then ok "picker renders"; else fail "picker renders"; fi
+if pane | grep -q "enter: launch"; then
+    ok "picker renders"
+else
+    fail "picker renders (pane: $(pane | tr '\n' ' ' | cut -c1-200))"
+fi
 # the id column is hidden from display (--with-nth), so assert order by
 # where the titles land on screen
 NL1="$(pane | grep -n "New Two" | head -1 | cut -d: -f1)"
