@@ -18,20 +18,13 @@
 
 set -euo pipefail
 
-WT="${1:-}"
+# shared walk-up discovery (also used by bin/sail and the tests)
+# shellcheck source=wtdir.sh
+. "$(dirname "$0")/wtdir.sh"
 
+WT="${1:-}"
 if [ -z "$WT" ]; then
-    BIN="$(command -v webtorrent 2>/dev/null || true)"
-    [ -n "$BIN" ] || exit 0
-    WT_REAL="$(readlink -f "$BIN" 2>/dev/null || printf '%s' "$BIN")"
-    d="$(dirname "$WT_REAL")"
-    while [ "$d" != "/" ] && [ "$d" != "." ]; do
-        if [ -f "$d/node_modules/webtorrent/index.js" ]; then
-            WT="$d/node_modules/webtorrent"
-            break
-        fi
-        d="$(dirname "$d")"
-    done
+    WT="$(find_webtorrent_module)"
 fi
 [ -n "$WT" ] && [ -f "$WT/lib/torrent.js" ] || exit 0
 

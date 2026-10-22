@@ -1,1 +1,6 @@
 .DS_Store
+
+# tool caches
+.ruff_cache/
+__pycache__/
+*.pyc

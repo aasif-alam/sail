@@ -120,7 +120,7 @@ else
     fail "wlist_lookup: got [$(wlist_lookup "$W/rows.tsv" 2)]"
 fi
 rc=0; wlist_lookup "$W/rows.tsv" 99 >/dev/null 2>&1 || rc=$?
-[ "$rc" -ne 0 ] && ok "wlist_lookup bad id fails" || fail "wlist_lookup bad id"
+if [ "$rc" -ne 0 ]; then ok "wlist_lookup bad id fails"; else fail "wlist_lookup bad id"; fi
 
 # 11. concurrent writers serialize on the lock instead of losing rows
 export SAIL_WLIST="$W/concurrent.tsv"

@@ -13,23 +13,20 @@ PASS=0 FAIL=0
 ok()   { PASS=$((PASS + 1)); printf 'ok   %s\n' "$1"; }
 fail() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; }
 
-command -v node >/dev/null 2>&1 || { echo "node not found — skipping"; exit 0; }
+if ! command -v node >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then echo "node not found — CI requires it" >&2; exit 1; fi
+    echo "node not found — skipping"; exit 0
+fi
+if ! command -v webtorrent >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then echo "webtorrent not found — CI requires it" >&2; exit 1; fi
+    echo "webtorrent not found — skipping"; exit 0
+fi
 
 # locate the webtorrent module the same way bin/sail does
-WTMOD="${SAIL_WTMOD:-}"
+. lib/wtdir.sh
+WTMOD="${SAIL_WTMOD:-$(find_webtorrent_module)}"
 if [ -z "$WTMOD" ]; then
-    WT_REAL="$(readlink -f "$(command -v webtorrent)" 2>/dev/null || true)"
-    d=""
-    [ -n "$WT_REAL" ] && d="$(dirname "$WT_REAL")"
-    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
-        if [ -f "$d/node_modules/webtorrent/index.js" ]; then
-            WTMOD="$d/node_modules/webtorrent"
-            break
-        fi
-        d="$(dirname "$d")"
-    done
-fi
-if [ -z "$WTMOD" ]; then
+    if [ -n "${CI:-}" ]; then echo "webtorrent module not found — CI requires it" >&2; exit 1; fi
     echo "webtorrent module not found — skipping"
     exit 0
 fi
@@ -51,7 +48,9 @@ rc=0; node lib/wt.js "$WTMOD" meta "$W/local.torrent" "$OUT" >"$W/meta.log" 2>&1
 if [ "$rc" -eq 0 ]; then ok "meta: exits 0"; else fail "meta: rc=$rc"; fi
 TSV_COUNT=0
 [ -s "$OUT/files.tsv" ] && TSV_COUNT=$(wc -l < "$OUT/files.tsv" | tr -d ' ')
-TFILE="$(cd "$OUT" && ls | grep '\.torrent$' | head -1)"
+TFILE="$(cd "$OUT" && for f in *.torrent; do
+    if [ -e "$f" ]; then printf '%s' "$f"; break; fi
+done)"
 HASH="${TFILE%.torrent}"
 if printf '%s' "$TFILE" | grep -Eq '^[0-9a-f]{40}\.torrent$'; then
     ok "meta: wrote <infohash>.torrent ($TFILE)"
@@ -95,20 +94,22 @@ fi
 #    watchdog kills it and files.tsv (the success signal) never appears
 OUT2="$W/out2"; mkdir -p "$OUT2"
 DEAD="magnet:?xt=urn:btih:0000000000000000000000000000000000000001&tr=udp%3A%2F%2Fnope.invalid%3A9%2Fannounce"
-node lib/wt.js "$WTMOD" meta "$DEAD" "$OUT2" >"$W/dead.log" 2>&1 &
-DPID=$!
-i=0
-while kill -0 "$DPID" 2>/dev/null && [ "$i" -lt 12 ]; do
-    i=$((i + 1)); sleep 0.5
-done
-kill "$DPID" 2>/dev/null || true
-sleep 0.3
-kill -9 "$DPID" 2>/dev/null || true
-wait "$DPID" 2>/dev/null || true
+(
+    node lib/wt.js "$WTMOD" meta "$DEAD" "$OUT2" &
+    DPID=$!
+    i=0
+    while kill -0 "$DPID" 2>/dev/null && [ "$i" -lt 12 ]; do
+        i=$((i + 1)); sleep 0.5
+    done
+    kill "$DPID" 2>/dev/null || true
+    sleep 0.3
+    kill -9 "$DPID" 2>/dev/null || true
+    wait "$DPID" 2>/dev/null || true
+) 2>/dev/null || true
 if [ ! -e "$OUT2/files.tsv" ] && [ -z "$(ls "$OUT2" 2>/dev/null)" ]; then
     ok "dead magnet: no files.tsv, no partial output before watchdog kill"
 else
-    fail "dead magnet: leftovers in $OUT2 [$(ls "$OUT2" 2>/dev/null | tr '\n' ' ')]"
+    fail "dead magnet: leftovers in $OUT2 [$(find "$OUT2" -mindepth 1 -maxdepth 1 2>/dev/null | tr '\n' ' ')]"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

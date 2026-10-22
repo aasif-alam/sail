@@ -4,10 +4,16 @@
 # scripts from (e.g. "$(brew --prefix)/etc/bash_completion.d/").
 
 _sail() {
-    local cur
+    local cur prev
     cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    # --magnet takes a link, not a sail option or a source name
+    if [ "$prev" = "--magnet" ]; then
+        COMPREPLY=()
+        return 0
+    fi
     if [ "$COMP_CWORD" -eq 1 ]; then
-        COMPREPLY=($(compgen -W "sources wlist -s -d -h -v --version" -- "$cur"))
+        COMPREPLY=($(compgen -W "sources wlist -s --stream -d --download -l --list --json --magnet -h --help -v --version" -- "$cur"))
     fi
 }
 complete -F _sail sail

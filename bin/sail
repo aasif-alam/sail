@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
 # sail — search, stream, and download torrents from the terminal.
 #
-# Usage:
 #   sail <query>        pick a result, then stream or download
 #   sail -d <query>     download straight to ~/Downloads
 #   sail -s <query>     stream in your media player
+#   sail -l <query>     list results without the picker
+#   sail --json <query> print results as JSON
+#   sail --magnet LINK  skip the search and use a magnet link
 #   sail sources        choose which sources to search
 #   sail wlist [query]  launch or manage saved torrents (ctrl-x saves one)
 #   sail --version      print the version and exit
-#   sail -h             show this help
+#   sail -h, --help     show this help
 #
 # SAIL_DEBUG=1 prints each source's stderr (timeouts, parse errors) after
-# a search instead of discarding it, and why a subtitle already inside a
-# streamed torrent (if any) failed to fetch.
+# a search instead of just the one-line summary, and why a subtitle already
+# inside a streamed torrent (if any) failed to fetch.
 #
-# A macOS notification fires when a background download finishes or fails.
+# A macOS notification fires when a background download finishes or fails
+# (SAIL_NOTIFY=0 disables it).
 
 set -euo pipefail
 
@@ -26,6 +29,11 @@ if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
 else
     BLD=""; DIM=""; RED=""; GRN=""; YLW=""; CYN=""; RST=""
 fi
+
+# UTF-8 locale for the multibyte-safe width helpers (override if a machine
+# lacks the macOS default)
+UTF8_LOCALE="${SAIL_UTF8_LOCALE:-en_US.UTF-8}"
+export UTF8_LOCALE
 
 # bash expands ~ only in word expansion, never in a variable's value — so
 # TORRENT_DOWNLOAD_DIR='~/Videos' would otherwise create a literal "~" dir
@@ -39,8 +47,69 @@ expand_tilde() {
     fi
 }
 
-SAIL_VERSION="1.4.0"
-DOWNLOAD_DIR="$(expand_tilde "${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}")"
+SAIL_VERSION="1.5.0"
+DOWNLOAD_DIR="$(expand_tilde "${SAIL_DOWNLOAD_DIR:-${TORRENT_DOWNLOAD_DIR:-$HOME/Downloads/torrents}}")"
+
+usage() {
+    cat <<'EOF'
+sail — search, stream, and download torrents from the terminal.
+
+Usage:
+  sail <query>              pick a result, then stream or download
+  sail -s <query>           stream the picked result immediately
+  sail -d <query>           download the picked result immediately
+  sail -l <query>           list results without the picker
+  sail --json <query>       print results as JSON
+  sail --magnet <link>      use a magnet link instead of searching
+  sail sources              choose which sources every search uses
+  sail wlist [query]        launch or manage saved torrents (ctrl-x saves one)
+  sail --version            print the installed version
+  sail -h, --help           show this help
+
+Options may appear before or after the query:
+  -s, --stream              stream the picked result immediately
+  -d, --download            download the picked result immediately
+  -l, --list                print seeders/size/source/title and exit
+      --json                print results as JSON (implies --list)
+      --magnet <link>       skip the search and use this magnet link
+EOF
+    exit "${1:-1}"
+}
+
+# ---- fast paths: no temp dir, no window resize, no cache cleanup ----------
+case "${1:-}" in
+    -v|--version)
+        printf 'sail %s\n' "$SAIL_VERSION"
+        exit 0 ;;
+    -h|--help)
+        usage 0 ;;
+esac
+
+# ---- locate lib/ next to the real script (follows the install symlink) ----
+# readlink -f is not portable to older macOS, so resolve the link by hand.
+SELF="${BASH_SOURCE[0]}"
+while [ -L "$SELF" ]; do
+    SELF_DIR="$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in
+        /*) ;;
+        *) SELF="$SELF_DIR/$SELF" ;;
+    esac
+done
+LIB_DIR="$(cd -P "$(dirname "$SELF")/../lib" >/dev/null 2>&1 && pwd)"
+
+# shellcheck source=../lib/wtdir.sh
+. "$LIB_DIR/wtdir.sh"
+# shellcheck source=../lib/wlist.sh
+. "$LIB_DIR/wlist.sh"
+# shellcheck source=../lib/dashboard.sh
+. "$LIB_DIR/dashboard.sh"
+# shellcheck source=../lib/sources-ui.sh
+. "$LIB_DIR/sources-ui.sh"
+# shellcheck source=../lib/wlist-ui.sh
+. "$LIB_DIR/wlist-ui.sh"
+# shellcheck source=../lib/torrent.sh
+. "$LIB_DIR/torrent.sh"
 
 # SIGTERM, give it a moment, then SIGKILL — webtorrent's destroy can hang
 # for a very long time on unreachable trackers
@@ -54,41 +123,12 @@ stop_pid() {
     kill -9 "$p" 2>/dev/null || true
 }
 
-# stop the dashboard renderer and clear its block. TERM first (it's usually
-# mid-sleep, and bash only runs its cleanup trap once sleep returns), a
-# short grace, then SIGKILL — so it can never redraw a frame after our
-# cleanup. Moving the cursor back up DASH_H lines and erasing from there
-# wipes the whole block in one shot
-stop_render() {
-    [ -n "${RENDER_PID:-}" ] || return 0
-    local pid="$RENDER_PID"
-    # clear the slot first: download mode calls stop_render explicitly and
-    # the EXIT trap checks it again — a second stop would erase the done/
-    # error lines printed in between
-    RENDER_PID=""
-    kill "$pid" 2>/dev/null || true
-    sleep 0.3
-    kill -9 "$pid" 2>/dev/null || true
-    # reap it ourselves, else bash reports the SIGKILL as
-    # "line NNN: PID Killed: 9 render_status ..." at the next prompt.
-    # wait returns 137 after that SIGKILL; without || true, set -e would
-    # abort here — before the block is cleared and before callers print
-    wait "$pid" 2>/dev/null || true
-    if [ -f "$WORK/render.frame" ]; then
-        printf '\033[%dA\033[J' "${DASH_H:-15}"
-        rm -f "$WORK/render.frame"
-    fi
-    # restore the cursor even when the renderer died before its first frame
-    printf '\033[?25h'
-}
-
-usage() {
-    sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
-    exit "${1:-1}"
-}
+# clear whatever the caller printed on the current line
+clear_line() { printf '\r\033[K'; }
 
 # best-effort macOS notification — never blocks or fails the caller
 notify() {  # $1 = title, $2 = message
+    [ "${SAIL_NOTIFY:-1}" = 1 ] || return 0
     command -v osascript >/dev/null 2>&1 || return 0
     local t m
     t="$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
@@ -96,35 +136,46 @@ notify() {  # $1 = title, $2 = message
     osascript -e "display notification \"$m\" with title \"$t\"" >/dev/null 2>&1 || true
 }
 
-SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
-LIB_DIR="$(cd "$(dirname "$SELF")/../lib" && pwd)"
 WORK="$(mktemp -d -t sail.XXXXXX)"
+
 # clean temp files on every exit path — including Ctrl+C and closed windows.
-# WT_PID and WPID both go through stop_pid (SIGTERM, then SIGKILL if they
-# don't die) — a plain kill, or no kill at all, can leave an orphaned
+# WT_PID, WPID and SEARCH_PID all go through stop_pid (SIGTERM, then SIGKILL
+# if they don't die) — a plain kill, or no kill at all, can leave an orphaned
 # webtorrent process running in the background (holding ports that then
-# break the NEXT run with "address already in use") when destroy() hangs,
-# per the comment above stop_pid — WPID is the metadata-fetch process
-# (the wt.js meta invocation below), which runs well before WT_PID exists
-trap 'if [ -n "${RENDER_PID:-}" ]; then stop_render; fi; [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"; [ -n "${WPID:-}" ] && stop_pid "$WPID"; rm -rf "$WORK"' EXIT INT TERM
+# break the NEXT run with "address already in use") when destroy() hangs.
+# Signals exit explicitly: the old shared EXIT/INT trap cleaned up and then
+# let the script keep running against a deleted temp dir.
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+cleanup() {
+    if [ -n "${RENDER_PID:-}" ]; then stop_render; fi
+    [ -n "${WT_PID:-}" ] && stop_pid "$WT_PID"
+    [ -n "${WPID:-}" ] && stop_pid "$WPID"
+    [ -n "${SEARCH_PID:-}" ] && stop_pid "$SEARCH_PID"
+    rm -rf "$WORK"
+    return 0
+}
+# shellcheck disable=SC2329  # invoked by the INT/TERM trap below
+on_signal() {
+    trap - EXIT
+    cleanup
+    exit 130
+}
+trap cleanup EXIT
+trap on_signal INT TERM
 
 # no torrent data persists between runs — wipe any leftover cache from
 # before this behavior existed (nothing writes here anymore, so after the
-# first launch this is a no-op)
+# first launch this is a no-op). After the fast paths: `sail --version`
+# has no business deleting anything.
 rm -rf "$HOME/.cache/sail"
-
-# watchlist storage — kept in lib/ so tests can exercise it without a tty
-# (SC1091: the source path is resolved at runtime via LIB_DIR)
-# shellcheck disable=SC1091
-if [ -f "$LIB_DIR/wlist.sh" ]; then . "$LIB_DIR/wlist.sh"; fi
 
 # ---- grow the terminal window so results fit (never shrink) ---------------
 # stty size < /dev/tty rather than tput cols: inside $( ) tput's stdout is a
 # pipe, it can't ioctl the terminal, and it falls back to terminfo's 80
 if [ -t 1 ]; then
     WANT_C=140; WANT_R=42
-    CUR_C="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2)"
-    CUR_R="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f1)"
+    CUR_C="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2 || true)"
+    CUR_R="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f1 || true)"
     if [ "${CUR_C:-0}" -lt "$WANT_C" ] || [ "${CUR_R:-0}" -lt "$WANT_R" ]; then
         NEW_C=$(( CUR_C > WANT_C ? CUR_C : WANT_C ))
         NEW_R=$(( CUR_R > WANT_R ? CUR_R : WANT_R ))
@@ -133,216 +184,86 @@ if [ -t 1 ]; then
     fi
 fi
 
-# ---- `sail --version` -------------------------------------------------------
-if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-v" ]; then
-    printf 'sail %s\n' "$SAIL_VERSION"
-    exit 0
-fi
-
 # ---- `sail sources` — choose which sources every search uses --------------
 if [ "${1:-}" = "sources" ]; then
     CONF="$(expand_tilde "${SAIL_SOURCES:-$HOME/.config/sail/sources.conf}")"
-    mkdir -p "$(dirname "$CONF")"
-
-    python3 "$LIB_DIR/search.py" --list-sources > "$WORK/results"
-
-    NAMES=(); DESCS=(); ON=()
-    while IFS=$'\t' read -r name desc def; do
-        NAMES+=("$name"); DESCS+=("$desc")
-        if [ -f "$CONF" ]; then
-            # an existing file is authoritative — even an empty one, which
-            # means "search nothing" (the old fallback silently re-enabled
-            # the defaults while the UI showed every source as off)
-            if grep -qx "$name" "$CONF"; then ON+=(1); else ON+=(0); fi
-        else
-            # no file yet: show what a search will actually use
-            ON+=("${def:-0}")
-        fi
-    done < "$WORK/results"
-
-    DIRTY=0
-    SNOTE=""
-    # column widths come from the data, not a hardcoded %-32s — tcsv's
-    # description is 37 chars and overflowed the old fixed column
-    NAMEW="$(printf '%s\n' "${NAMES[@]}" | awk '{ if (length($0) > m) m = length($0) } END { printf "%d", m }')"
-    DESCW="$(printf '%s\n' "${DESCS[@]}" | awk '{ if (length($0) > m) m = length($0) } END { printf "%d", m }')"
-    ROWW=$((NAMEW + 1 + DESCW))
-
-    # one content row: "  │ <colored text> <pad> │". Width is measured by
-    # wc -m (chars, locale-aware) on the escape-stripped text — awk's
-    # length() is byte-based on stock macOS and would misplace the right
-    # edge whenever the content holds a multibyte char like the title's —
-    boxline() {
-        local ln vis pad
-        while IFS= read -r ln; do
-            vis="$(printf '%s' "$ln" | sed $'s/\x1b\\[[0-9;]*m//g' \
-                | LC_ALL=en_US.UTF-8 wc -m | tr -d ' ')"
-            pad=$((ROWW + 12 - vis))
-            [ "$pad" -ge 0 ] || pad=0
-            printf '  │ %s%*s│\n' "$ln" "$pad" ""
-        done <<< "$1"
-    }
-
-    draw() {
-        local i
-        printf '\033[H\033[2J'
-        printf '  ╭─'
-        for ((i = 0; i < ROWW + 12; i++)); do printf '─'; done
-        printf '╮\n'
-        boxline "$(printf '%ssources%s — used by every search' "$BLD" "$RST")"
-        boxline ""
-        for i in "${!NAMES[@]}"; do
-            if [ "${ON[$i]}" = 1 ]; then
-                boxline "$(printf '%s%-2s%s %s[x]%s %-*s %s%s%s' \
-                    "$DIM" "$((i + 1))" "$RST" "$GRN" "$RST" \
-                    "$NAMEW" "${NAMES[$i]}" "" "${DESCS[$i]}" "$RST")"
-            else
-                boxline "$(printf '%s%-2s%s %s[ ]%s %-*s %s%s%s' \
-                    "$DIM" "$((i + 1))" "$RST" "$DIM" "$RST" \
-                    "$NAMEW" "${NAMES[$i]}" "$DIM" "${DESCS[$i]}" "$RST")"
-            fi
-        done
-        boxline ""
-        boxline "$(printf 'toggle: number (e.g. %s1 3%s)   %sa%s all   %sx%s none' \
-            "$BLD" "$RST" "$BLD" "$RST" "$BLD" "$RST")"
-        boxline "$(printf '%ss%s save   %sq%s quit' "$BLD" "$RST" "$BLD" "$RST")$SNOTE"
-        printf '  ╰─'
-        for ((i = 0; i < ROWW + 12; i++)); do printf '─'; done
-        printf '╯\n\n  > '
-    }
-
-    toggle() {
-        local n="$1" i
-        case "$n" in
-            ''|*[!0-9]*) return 1 ;;
-        esac
-        i=$((n - 1))
-        if [ "$i" -ge 0 ] && [ "$i" -lt "${#NAMES[@]}" ]; then
-            if [ "${ON[$i]}" = 1 ]; then ON[i]=0; else ON[i]=1; fi
-            DIRTY=1
-            return 0
-        fi
-        return 1
-    }
-
-    while draw && read -r -a tokens; do
-        case "${tokens[0]:-}" in
-            s|S)
-                if [ "$DIRTY" = 1 ]; then
-                    : > "$CONF"
-                    for i in "${!NAMES[@]}"; do
-                        if [ "${ON[$i]}" = 1 ]; then
-                            printf '%s\n' "${NAMES[$i]}" >> "$CONF"
-                        fi
-                    done
-                    printf '\n  saved %s%s%s\n' "$BLD" "$CONF" "$RST"
-                else
-                    printf '\n  nothing changed\n'
-                fi
-                exit 0
-                ;;
-            q|Q) printf '\n  (not saved)\n'; exit 0 ;;
-            a|A) for i in "${!NAMES[@]}"; do ON[i]=1; done; DIRTY=1; SNOTE="" ;;
-            x|X) for i in "${!NAMES[@]}"; do ON[i]=0; done; DIRTY=1; SNOTE="" ;;
-            *)
-                BAD=""
-                for n in "${tokens[@]+"${tokens[@]}"}"; do
-                    if ! toggle "$n"; then
-                        [ -n "$BAD" ] && BAD="$BAD "
-                        BAD="$BAD$n"
-                    fi
-                done
-                # silent no-op on bad input read as ignored keypresses —
-                # echo them back dim, like the pickers' NOTICE
-                if [ -n "$BAD" ]; then
-                    SNOTE=$'\n'"unknown: $BAD"
-                else
-                    SNOTE=""
-                fi ;;
-        esac
-    done
+    sail_sources_ui "$CONF"
     exit 0
 fi
 
 # ---- `sail wlist [query]` — launch or manage the watchlist ----------------
+SKIP_SEARCH=0
 if [ "${1:-}" = "wlist" ]; then
     shift
-    WQUERY="$*"
-    MODE="ask"
     command -v wlist_add >/dev/null 2>&1 \
         || { printf '  sail is missing lib/wlist.sh — reinstall sail\n' >&2; exit 1; }
-    if [ ! -s "$(wlist_file)" ]; then
-        printf '  watchlist is empty — search something and press %sctrl-x%s to add it\n' \
-            "$BLD" "$RST"
+    if sail_wlist_ui "$*"; then
+        SKIP_SEARCH=1
+        set --   # the wlist query is consumed; don't parse it as sail options
+    else
         exit 0
     fi
-    NOTICE=""
-    while :; do
-        cp "$(wlist_file)" "$WORK/wlist_rows"
-        # display newest first (the file stores newest last); the leading
-        # number is the row's line number in wlist_rows, which
-        # wlist_lookup turns back into title + magnet at launch time.
-        # now comes in via -v because macOS's stock awk has no systime()
-        ROWS="$(awk -F'\t' -v D="$DIM" -v B="$BLD" -v R="$RST" -v now="$(date +%s)" '
-            function agestr(s,   d) {
-                d = now - s; if (d < 0) d = 0
-                if (d < 60)      return "just now"
-                if (d < 3600)    return int(d / 60) "m ago"
-                if (d < 86400)   return int(d / 3600) "h ago"
-                if (d < 2592000) return int(d / 86400) "d ago"
-                return int(d / 2592000) "mo ago"
-            }
-            { printf "%d\t%s%-9s%s %s%s%s\n", NR, D, agestr($3), R, B, $1, R }' \
-            "$WORK/wlist_rows" | sort -t "$(printf '\t')" -k1,1nr)"
-        if [ -z "$ROWS" ]; then
-            printf '  watchlist is empty\n'
-            exit 0
-        fi
-        OUT="$(printf '%s\n' "$ROWS" | fzf --ansi --expect=ctrl-x \
-              --delimiter='\t' --with-nth=2,3 \
-              --query="$WQUERY" \
-              --header="saved     title"$'\n'"  enter: launch   ctrl-x: remove   esc: quit$NOTICE" \
-              --header-first --reverse --height=90% --tabstop=1 \
-              --border=rounded --margin=1,2)" || exit 0
-        PICK_KEY="${OUT%%$'\n'*}"
-        LINE="$(printf '%s' "$OUT" | sed -n '2p')"
-        PLAIN="$(printf '%s' "$LINE" | sed $'s/\x1b\\[[0-9;]*m//g')"
-        WID="$(printf '%s\n' "$PLAIN" | cut -f1)"
-        WLOOK="$(wlist_lookup "$WORK/wlist_rows" "$WID" || true)"
-        WTITLE="${WLOOK%%$'\t'*}"
-        WMAGNET="${WLOOK#*$'\t'}"
-        if [ "$PICK_KEY" = "ctrl-x" ] && [ -n "$WTITLE" ]; then
-            if wlist_remove "$WMAGNET"; then
-                NOTICE=$'\n\n'"  removed from watchlist: $WTITLE"
-            else
-                NOTICE=$'\n\n'"  couldn't remove: $WTITLE"
-            fi
-            continue
-        fi
-        break
-    done
-    [ -n "$WTITLE" ] && [ -n "$WMAGNET" ] || exit 0
-    SEL_TITLE="$WTITLE"
-    MAGNET="$WMAGNET"
-    SKIP_SEARCH=1
 fi
 
-# `sail wlist` skips flag parsing entirely — its optional argument is a
-# plain query for filtering the list, not -s/-d
-if [ "${SKIP_SEARCH:-0}" != 1 ]; then
-    MODE="ask"
-    while getopts "sdh" opt; do
-        case "$opt" in
-            s) MODE="stream" ;;
-            d) MODE="download" ;;
-            h) usage 0 ;;
-            *) usage ;;
-        esac
-    done
-    shift $((OPTIND - 1))
-    [ $# -ge 1 ] || usage
+# ---- options and query ----------------------------------------------------
+MODE="ask"
+LIST_MODE=0
+JSON_MODE=0
+MAGNET=""
+QUERY=""
 
-    QUERY="$*"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s|--stream) MODE="stream" ;;
+        -d|--download) MODE="download" ;;
+        -l|--list) LIST_MODE=1 ;;
+        --json) JSON_MODE=1; LIST_MODE=1 ;;
+        -v|--version)
+            printf 'sail %s\n' "$SAIL_VERSION"
+            exit 0 ;;
+        -h|--help) usage 0 ;;
+        --magnet)
+            shift
+            [ $# -ge 1 ] || usage
+            MAGNET="$1" ;;
+        --magnet=*) MAGNET="${1#*=}" ;;
+        --)
+            shift
+            while [ $# -gt 0 ]; do
+                QUERY="${QUERY:+$QUERY }$1"
+                shift
+            done
+            break ;;
+        -*)
+            printf 'sail: unknown option: %s\n' "$1" >&2
+            usage ;;
+        *)
+            QUERY="${QUERY:+$QUERY }$1" ;;
+    esac
+    shift
+done
+
+if [ -n "$MAGNET" ]; then
+    case "$MAGNET" in
+        magnet:?*)
+            [ -n "$QUERY" ] && usage
+            SKIP_SEARCH=1
+            # the display name is the magnet's dn= parameter, when present
+            SEL_TITLE="$(python3 - "$MAGNET" <<'PY' 2>/dev/null || true
+import sys, urllib.parse
+q = urllib.parse.parse_qs(urllib.parse.urlsplit(sys.argv[1]).query)
+print((q.get("dn") or ["magnet link"])[0])
+PY
+)"
+            [ -n "$SEL_TITLE" ] || SEL_TITLE="magnet link" ;;
+        *)
+            printf 'sail: that is not a magnet link: %s\n' "$MAGNET" >&2
+            usage ;;
+    esac
+fi
+
+if [ "$SKIP_SEARCH" != 1 ]; then
+    [ -n "$QUERY" ] || usage
     # `sail ""` passed the arg count but searched for nothing; treat it as
     # missing input rather than printing "no results for "
     case "$QUERY" in
@@ -351,51 +272,149 @@ if [ "${SKIP_SEARCH:-0}" != 1 ]; then
     esac
 fi
 
+SEL_TITLE="${SEL_TITLE:-}"
+
 # braille spinner, shared by the search/meta phases and the live dashboard
 SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
 
-# ---- 1. search + 2. pick (skipped when launching from the watchlist) ------
-search_and_pick() {
-    printf '  searching for %s%s%s ' "$CYN" "$QUERY" "$RST"
-    # SAIL_DEBUG=1 keeps each source's stderr (timeouts, parse failures, etc.)
-    # instead of discarding it — a source that silently returns nothing is
-    # otherwise impossible to diagnose
-    if [ "${SAIL_DEBUG:-0}" = 1 ]; then
-        python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>"$WORK/search.err" &
+# ---- search ---------------------------------------------------------------
+
+# run search.py with a spinner on stderr (keeps stdout clean for -l/--json).
+# returns search.py's status: 0 ok, 2 every source failed, 3 none enabled.
+sail_search() {  # $1 = query, $2 = output file, $3 = 1 for JSON
+    local query="$1" out="$2" as_json="${3:-0}" rc=0 i=0
+    if [ "$as_json" = 1 ]; then
+        python3 "$LIB_DIR/search.py" --json "$query" > "$out" 2>"$WORK/search.err" &
     else
-        python3 "$LIB_DIR/search.py" "$QUERY" > "$WORK/results" 2>/dev/null &
+        python3 "$LIB_DIR/search.py" "$query" > "$out" 2>"$WORK/search.err" &
     fi
     SEARCH_PID=$!
-    i=0
     while kill -0 "$SEARCH_PID" 2>/dev/null; do
-        printf '%s%s%s\b' "$CYN" "${SPIN[$((i % 10))]}" "$RST"
+        # a redirected stderr gets plain text, not a stream of braille/backspaces
+        if [ -t 2 ]; then
+            printf '%s%s%s\b' "$CYN" "${SPIN[$((i % 10))]}" "$RST" >&2
+        fi
         i=$((i + 1))
         sleep 0.25
     done
-    wait "$SEARCH_PID" || true
-    printf '\r%*s\r' 80 ''
+    wait "$SEARCH_PID" || rc=$?
+    SEARCH_PID=""
+    if [ -t 2 ]; then clear_line >&2; fi
+    return "$rc"
+}
 
-    if [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/search.err" ]; then
+# per-source errors in debug mode; a single summary line otherwise
+sail_search_report() {
+    [ -s "$WORK/search.err" ] || return 0
+    if [ "${SAIL_DEBUG:-0}" = 1 ]; then
         printf '  %sdebug:%s\n' "$DIM" "$RST" >&2
         sed 's/^/    /' "$WORK/search.err" >&2
+    else
+        grep '^\[sources\]' "$WORK/search.err" 2>/dev/null \
+            | while IFS= read -r line; do
+                  printf '  %s%s%s\n' "$DIM" "$line" "$RST" >&2
+              done
     fi
+}
+
+sail_search_failed() {  # $1 = rc, $2 = query
+    case "$1" in
+        3) printf '  %sno sources enabled%s — run: %ssail sources%s\n' \
+               "$BLD" "$RST" "$CYN" "$RST" >&2 ;;
+        2) printf '  %scouldn'"'"'t reach any source%s — check your connection%s\n' \
+               "$BLD" "$RST" \
+               "$([ "${SAIL_DEBUG:-0}" = 1 ] && printf ' (see the source errors above)')" >&2 ;;
+        *) printf '  no results for %s%s%s\n' "$BLD" "$2" "$RST" >&2
+           printf '  %stry fewer words, or add sources: sail sources%s\n' "$DIM" "$RST" >&2 ;;
+    esac
+}
+
+# ---- results list ---------------------------------------------------------
+
+# sorted_results <file> <seed|size|age> — same rows, different order; the
+# id column stays intact, so the caller's lookups by id keep working
+sorted_results() {
+    case "$2" in
+        size)
+            awk -F'\t' '
+                function bytes(s,   n, u) {
+                    if (s == "?" || s == "") return -1
+                    n = s + 0
+                    u = s; sub(/^[0-9.]+[ ]*/, "", u); sub(/B$/, "", u)
+                    if (u == "K") return n * 1024
+                    if (u == "M") return n * 1048576
+                    if (u == "G") return n * 1073741824
+                    if (u == "T") return n * 1099511627776
+                    return n
+                }
+                { printf "%d\t%s\n", bytes($3), $0 }' "$1" \
+                | sort -t "$(printf '\t')" -k1,1nr \
+                | cut -f2- ;;
+        age)
+            awk -F'\t' '
+                function secs(s,   n, u) {
+                    if (s == "?" || s == "") return 1e18
+                    if (s == "just now") return 0
+                    n = s + 0
+                    u = s; sub(/^[0-9]+/, "", u); sub(/ ago$/, "", u)
+                    if (u == "m") return n * 60
+                    if (u == "h") return n * 3600
+                    if (u == "d") return n * 86400
+                    if (u == "mo") return n * 2592000
+                    if (u == "y") return n * 31536000
+                    return 1e18
+                }
+                { printf "%d\t%s\n", secs($6), $0 }' "$1" \
+                | sort -t "$(printf '\t')" -k1,1n \
+                | cut -f2- ;;
+        *)
+            sort -t "$(printf '\t')" -k2,2nr "$1" ;;
+    esac
+}
+
+# print results as a plain table (no picker) — for `sail -l`
+list_results() {
+    awk -F'\t' '{ printf "%6s  %-9s %-6s %s\n", $2, $3, $4, $5 }' "$1"
+}
+
+sort_label() {
+    case "$1" in
+        size) printf 'size' ;;
+        age)  printf 'newest' ;;
+        *)    printf 'seeders' ;;
+    esac
+}
+
+next_sort() {
+    case "$1" in
+        seed) printf 'size' ;;
+        size) printf 'age' ;;
+        *)    printf 'seed' ;;
+    esac
+}
+
+# ---- 1. search + 2. pick --------------------------------------------------
+search_and_pick() {
+    printf '  searching for %s%s%s ' "$CYN" "$QUERY" "$RST" >&2
+    local rc=0 n_results
+    sail_search "$QUERY" "$WORK/results" || rc=$?
+    sail_search_report
 
     if [ ! -s "$WORK/results" ]; then
-        printf '  no results for %s%s%s\n' "$BLD" "$QUERY" "$RST"
-        printf '  %stry fewer words, or add sources: sail sources%s\n' "$DIM" "$RST"
+        sail_search_failed "$rc" "$QUERY"
         exit 1
     fi
 
-    N_RESULTS=$(wc -l < "$WORK/results" | tr -d ' ')
-    printf '  %s%s results%s\n\n' "$BLD" "$N_RESULTS" "$RST"
+    n_results=$(wc -l < "$WORK/results" | tr -d ' ')
+    printf '  %s%s results%s\n\n' "$BLD" "$n_results" "$RST" >&2
 
-    # ---- 2. pick a torrent — ctrl-x saves one to the watchlist ------------
+    # ---- 2. pick a torrent — ctrl-x saves one, ctrl-t re-sorts ------------
     # --expect makes fzf print the pressed key ahead of the selection, which
-    # is how ctrl-x is told apart from plain enter; the loop redraws the list
-    # after a save, so several torrents can be watchlisted in one pass
-    # (cmd+x would read better but terminals swallow it for their Edit menu —
-    # CLI apps never see it)
-    NOTICE=""
+    # is how ctrl-x/ctrl-t are told apart from plain enter; the loop redraws
+    # the list after a save, so several torrents can be watchlisted in one
+    # pass (cmd+x would read better but terminals swallow it for their Edit
+    # menu — CLI apps never see it)
+    local NOTICE="" SORT_MODE="seed" OUT PICK_KEY LINE
     while :; do
         # rows are tab-delimited so fzf can hide the internal row id from the
         # display (--with-nth) while the selection still carries it in field
@@ -404,7 +423,8 @@ search_and_pick() {
         # joined by a single column, and the header below is padded so each
         # word starts at the column its field starts at (verified in a pty:
         # header and row words land on identical columns)
-        OUT="$(awk -F'\t' -v R="$RST" -v D="$DIM" \
+        OUT="$(sorted_results "$WORK/results" "$SORT_MODE" \
+            | awk -F'\t' -v R="$RST" -v D="$DIM" \
             -v G="$GRN" -v Y="$YLW" -v Rd="$RED" -v C="$CYN" -v B="$BLD" '{
             id=$1; seed=$2+0; size=$3; src=$4; title=$5; age=$6
             if (seed >= 50)      sc = G
@@ -414,23 +434,45 @@ search_and_pick() {
             if (age != "?") agecol = sprintf("%s  (%s)%s", D, age, R)
             printf "%s\t%s%-5s%s\t%-9s\t%-6s\t%s%s%s\t%s\n", \
                 id, sc, seed, R, size, src, B, title, R, agecol
-        }' "$WORK/results" | fzf --ansi --expect=ctrl-x \
+        }' | fzf --ansi --expect=ctrl-x,ctrl-t \
               --delimiter='\t' --with-nth=2,3,4,5,6 \
-              --header="seed  size      source title"$'\n'"  enter: select   ctrl-x: watchlist   esc: cancel$NOTICE" \
+              --header="seed  size      source title"$'\n'"  enter: select   ctrl-x: watchlist   ctrl-t: sort ($(sort_label "$SORT_MODE"))   esc: cancel$NOTICE" \
               --header-first --reverse --height=90% --tabstop=1 \
               --border=rounded --margin=1,2)" || exit 0
         PICK_KEY="${OUT%%$'\n'*}"
         LINE="$(printf '%s' "$OUT" | sed -n '2p')"
+
+        case "$PICK_KEY" in
+            *ctrl-t*)
+                SORT_MODE="$(next_sort "$SORT_MODE")"
+                NOTICE=""
+                continue ;;
+        esac
+
         if [ "$PICK_KEY" = "ctrl-x" ]; then
+            local PLAINX XID XTITLE XMAGNET SAVED_MAGNET SAVE_NOTE RESOLVED
             PLAINX="$(printf '%s' "$LINE" | sed $'s/\x1b\\[[0-9;]*m//g')"
             XID="$(printf '%s\n' "$PLAINX" | cut -f1)"
             XTITLE="$(awk -F'\t' -v id="$XID" '$1 == id { print $5; exit }' "$WORK/results")"
             XMAGNET="$(awk -F'\t' -v id="$XID" '$1 == id { print $7; exit }' "$WORK/results")"
             if [ -n "$XTITLE" ] && [ -n "$XMAGNET" ]; then
-                if wlist_add "$XTITLE" "$XMAGNET"; then
-                    NOTICE=$'\n\n'"  saved to watchlist: $XTITLE"
+                SAVED_MAGNET="$XMAGNET"
+                SAVE_NOTE=""
+                # scraped sources only have a detail-page URL at save time;
+                # resolving it now keeps the saved entry usable after the
+                # search page is gone (and dedupes it against magnets saved
+                # from other sources)
+                if [[ "$SAVED_MAGNET" == FETCH:* ]]; then
+                    if RESOLVED="$(resolve_magnet "${SAVED_MAGNET#FETCH:}")"; then
+                        SAVED_MAGNET="$RESOLVED"
+                    else
+                        SAVE_NOTE=" (link unresolved)"
+                    fi
+                fi
+                if wlist_add "$XTITLE" "$SAVED_MAGNET"; then
+                    NOTICE=$'\n\n'"  saved to watchlist: $XTITLE$SAVE_NOTE"
                 else
-                    NOTICE=$'\n\n'"  already watchlisted (moved to top): $XTITLE"
+                    NOTICE=$'\n\n'"  already watchlisted (moved to top): $XTITLE$SAVE_NOTE"
                 fi
             fi
             continue
@@ -440,26 +482,81 @@ search_and_pick() {
 
     [ -n "$LINE" ] || exit 0
 
+    local PLAIN SEL_ID
     PLAIN="$(printf '%s' "$LINE" | sed $'s/\x1b\\[[0-9;]*m//g')"
     SEL_ID="$(printf '%s\n' "$PLAIN" | cut -f1)"
     SEL_TITLE="$(awk -F'\t' -v id="$SEL_ID" '$1 == id { print $5; exit }' "$WORK/results")"
     MAGNET="$(awk -F'\t' -v id="$SEL_ID" '$1 == id { print $7; exit }' "$WORK/results")"
 }
-if [ "${SKIP_SEARCH:-0}" != 1 ]; then
-    search_and_pick
-fi
 
-if [[ "$MAGNET" == FETCH:* ]]; then
-    printf '  resolving magnet link…\n'
-    # pass the URL as argv, not inside the script text: a quote in a scraped
-    # URL must not become Python syntax
-    MAGNET="$(python3 - "$LIB_DIR" "${MAGNET#FETCH:}" <<'PY'
+# resolve a scraped source's detail page into a magnet. stderr goes to a
+# file so a failure reads as one line, not a Python traceback.
+resolve_magnet() {
+    python3 - "$LIB_DIR" "$1" <<'PY' 2>"$WORK/resolve.err"
 import sys
 sys.path.insert(0, sys.argv[1])
 from search import magnet_from_detail
 print(magnet_from_detail(sys.argv[2]))
 PY
-)"
+}
+
+# ---- list / JSON modes ----------------------------------------------------
+if [ "$LIST_MODE" = 1 ]; then
+    # `--magnet ... -l/--json` has no search results to list — print the
+    # link itself so the flags are not silently ignored
+    if [ "$SKIP_SEARCH" = 1 ]; then
+        if [ "$JSON_MODE" = 1 ]; then
+            python3 -c 'import json, sys
+print(json.dumps([{"id": "0", "seeders": "", "size": "", "source": "magnet",
+                   "title": sys.argv[1], "age": "", "magnet": sys.argv[2]}],
+                 indent=2, ensure_ascii=False))' "$SEL_TITLE" "$MAGNET"
+        else
+            printf '%s\t%s\n' "$SEL_TITLE" "$MAGNET"
+        fi
+        exit 0
+    fi
+
+    printf '  searching for %s%s%s ' "$CYN" "$QUERY" "$RST" >&2
+    RC=0
+    if [ "$JSON_MODE" = 1 ]; then
+        sail_search "$QUERY" "$WORK/results.json" 1 || RC=$?
+    else
+        sail_search "$QUERY" "$WORK/results" 0 || RC=$?
+    fi
+    sail_search_report
+
+    if [ "$RC" -ne 0 ]; then
+        sail_search_failed "$RC" "$QUERY"
+        exit "$RC"
+    fi
+    if [ "$JSON_MODE" = 1 ]; then
+        cat "$WORK/results.json"
+    elif [ -s "$WORK/results" ]; then
+        list_results "$WORK/results"
+    else
+        sail_search_failed 0 "$QUERY"
+        exit 1
+    fi
+    exit 0
+fi
+
+if [ "$SKIP_SEARCH" != 1 ]; then
+    search_and_pick
+fi
+
+# ---- resolve a scraped detail-page URL ------------------------------------
+if [[ "$MAGNET" == FETCH:* ]]; then
+    printf '  resolving magnet link…\n'
+    if RESOLVED="$(resolve_magnet "${MAGNET#FETCH:}")"; then
+        MAGNET="$RESOLVED"
+    else
+        printf '  %scouldn'"'"'t resolve the magnet link%s — the source page is unavailable\n' \
+            "$RED" "$RST" >&2
+        if [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/resolve.err" ]; then
+            sed 's/^/    /' "$WORK/resolve.err" >&2
+        fi
+        exit 1
+    fi
 fi
 
 # options for the wt.js torrent runner: the magnet's trackers (the cached
@@ -470,27 +567,15 @@ OPTS_JSON="$(printf '%s' "$MAGNET" | tr '&' '\n' | sed -n 's/^tr=//p' | python3 
 import sys, urllib.parse, json, socket
 announce = [urllib.parse.unquote(x.strip()) for x in sys.stdin if x.strip()]
 ports = []
-for _ in range(3):
+for _ in range(2):
     s = socket.socket(); s.bind(("", 0)); ports.append(s.getsockname()[1]); s.close()
-print(json.dumps({"announce": announce, "torrentPort": ports[0], "dhtPort": ports[1], "serverPort": ports[2]}))')"
+print(json.dumps({"announce": announce, "torrentPort": ports[0], "dhtPort": ports[1]}))')"
 
 # locate the webtorrent node module — wt.js drives it directly because
 # webtorrent-cli's --select downloads the whole torrent (broken so).
-# SAIL_WTMOD overrides; the default walks up from the webtorrent binary
+# SAIL_WTMOD overrides; otherwise walk up from the webtorrent binary.
 WTMOD="${SAIL_WTMOD:-}"
-if [ -z "$WTMOD" ]; then
-    WT_REAL="$(readlink -f "$(command -v webtorrent)" 2>/dev/null || true)"
-    if [ -n "$WT_REAL" ]; then
-        d="$(dirname "$WT_REAL")"
-        while [ "$d" != "/" ] && [ "$d" != "." ]; do
-            if [ -f "$d/node_modules/webtorrent/index.js" ]; then
-                WTMOD="$d/node_modules/webtorrent"
-                break
-            fi
-            d="$(dirname "$d")"
-        done
-    fi
-fi
+[ -n "$WTMOD" ] || WTMOD="$(find_webtorrent_module)"
 
 # repair a known-broken webtorrent before first use: 2.8.5 (what
 # webtorrent-cli 6.x installs) crashes on every torrent add when its
@@ -503,7 +588,8 @@ bash "$LIB_DIR/fix-webtorrent.sh" "$WTMOD" || true
 if [ "$MODE" = "ask" ]; then
     printf '\n  %s%s%s\n' "$BLD" "$SEL_TITLE" "$RST"
     printf '  stream or download? [S/d/q] '
-    read -r answer
+    answer=""
+    read -r answer || true
     case "$answer" in
         d|D) MODE="download"; ASK_DIR=1 ;;
         q|Q) exit 0 ;;
@@ -511,545 +597,28 @@ if [ "$MODE" = "ask" ]; then
     esac
 fi
 
-if [ "$MODE" = "download" ] && [ "${ASK_DIR:-0}" = 1 ]; then
+if [ "$MODE" = "download" ]; then
     mkdir -p "$DOWNLOAD_DIR"
-    printf '  choose a folder in the picker (cancel = %s%s%s)\n' \
-        "$CYN" "$DOWNLOAD_DIR" "$RST"
-    PICKED="$(osascript -e "POSIX path of (choose folder with prompt \"Download folder:\" default location POSIX file \"$DOWNLOAD_DIR\")" 2>/dev/null || true)"
-    if [ -n "$PICKED" ]; then
-        DOWNLOAD_DIR="${PICKED%/}"
+    if [ "${ASK_DIR:-0}" = 1 ]; then
+        printf '  choose a folder in the picker (cancel = %s%s%s)\n' \
+            "$CYN" "$DOWNLOAD_DIR" "$RST"
+        PICKED="$(sail_pick_folder "$DOWNLOAD_DIR")"
+        if [ -n "$PICKED" ]; then
+            DOWNLOAD_DIR="${PICKED%/}"
+            [ -n "$DOWNLOAD_DIR" ] || DOWNLOAD_DIR="/"   # picked the volume root
+            mkdir -p "$DOWNLOAD_DIR"
+        fi
     fi
 fi
 
-mkdir -p "$DOWNLOAD_DIR"
+# metadata is fetched fresh every time — nothing is cached to disk
+sail_read_meta "$MAGNET"
+sail_videos
 
-# ---- shared: read the torrent's file list, whichever mode we're in --------
-# metadata is fetched fresh every time — nothing is cached to disk. One
-# wt.js meta process does what used to take three (webtorrent downloadmeta
-# + webtorrent info + a python json->tsv converter): it pulls the metadata
-# and writes <infohash>.torrent, info.json and files.tsv into $WORK, then
-# exits — files.tsv appearing is the success signal (it's written last,
-# via rename, so a killed run can't leave a truncated list). Skipped when
-# there's no webtorrent module: both modes fall back to webtorrent's own
-# picker/downloader anyway, which is where a missing file list sends them
-META=""
-
-# SAIL_META_WAIT is seconds. The spinner ticks twice a second, so compare
-# against seconds*2 — the old code compared the tick count directly,
-# silently halving the documented timeout.
-META_WAIT="${SAIL_META_WAIT:-300}"
-case "$META_WAIT" in ''|*[!0-9]*) META_WAIT=300 ;; esac
-
-printf '  reading torrent info '
-if [ -n "$WTMOD" ]; then
-    for META_TRY in 1 2; do
-        node "$LIB_DIR/wt.js" "$WTMOD" meta "$MAGNET" "$WORK" \
-            >"$WORK/meta.log" 2>&1 &
-        WPID=$!
-        i=0
-        while kill -0 "$WPID" 2>/dev/null; do
-            [ "$i" -ge $((META_WAIT * 2)) ] && break
-            printf '%s%s%s\b' "$CYN" "${SPIN[$((i % 10))]}" "$RST"
-            i=$((i + 1)); sleep 0.5
-        done
-        stop_pid "$WPID"
-        WPID=""
-        printf '\r%*s\r' 80 ''
-        if [ -s "$WORK/files.tsv" ]; then
-            META="$(find "$WORK" -maxdepth 1 -name '*.torrent' -print -quit)"
-            break
-        fi
-        META=""
-        if [ "$META_TRY" != 2 ]; then
-            printf '  %sno peers yet — retrying%s ' "$DIM" "$RST"
-        fi
-    done
-fi
-printf '\n'
-if [ -z "$META" ] && [ "${SAIL_DEBUG:-0}" = 1 ] && [ -s "$WORK/meta.log" ]; then
-    printf '  %smeta debug:%s\n' "$DIM" "$RST" >&2
-    sed 's/^/    /' "$WORK/meta.log" >&2
-fi
-
-VIDS=""
-if [ -s "$WORK/files.tsv" ]; then
-    VIDS="$(awk -F'\t' 'tolower($3) ~ /\.(mkv|mp4|avi|mov|webm|m4v|mpg|mpeg|wmv|flv|ts|m2ts|vob)$/' "$WORK/files.tsv")"
-fi
-N_VIDS="$(printf '%s\n' "$VIDS" | { grep -c . || true; })"
-
-# pick_video "$VIDS"        -> single-select (stream mode)
-# pick_video "$VIDS" multi  -> multi-select, tab toggles, ctrl-a/ctrl-d
-pick_video() {
-    # a plain string, not an array: bash 3.2 (macOS's stock /bin/bash) throws
-    # "unbound variable" under `set -u` when expanding an empty array with
-    # "${arr[@]}" — an empty scalar string has no such problem
-    local sorted common_dir fzf_extra="" \
-        header="size      ep      file"$'\n'"  enter: play   esc: cancel"
-    if [ "${2:-}" = "multi" ]; then
-        fzf_extra="--multi --bind ctrl-a:select-all,ctrl-d:deselect-all"
-        header="size      ep      file"$'\n'"  tab toggles · ctrl-a all · ctrl-d none · enter confirms"
-    fi
-    # sort by path, not raw torrent-file index: scene releases zero-pad
-    # episode numbers (S01E01, S01E10, ...), so alphabetical order is
-    # already the right watch order — the torrent's own file order isn't
-    sorted="$(printf '%s\n' "$1" | sort -t "$(printf '\t')" -k3)"
-    # if every file lives in the same folder (any season pack), show it
-    # once above the list instead of repeating it on every row
-    common_dir="$(printf '%s\n' "$sorted" | awk -F'\t' '{ d=$3; sub(/[^\/]*$/, "", d); print d }' | sort -u)"
-    if [ "$(printf '%s\n' "$common_dir" | grep -c .)" -ne 1 ]; then
-        common_dir=""
-    fi
-    # >&2, not stdout: the caller captures this function's stdout as the
-    # picked line(s) via $(...) — anything else printed to stdout here would
-    # get parsed as a bogus extra "selection"
-    [ -n "$common_dir" ] && printf '  %sin %s%s\n\n' "$DIM" "$common_dir" "$RST" >&2
-    # fzf_extra below is deliberately unquoted: it's a fixed, controlled
-    # string (not user input) that must word-split into separate fzf
-    # flags — see the array-avoidance comment near the top of this function
-    # shellcheck disable=SC2086
-    printf '%s\n' "$sorted" | awk -F'\t' -v D="$DIM" -v B="$BLD" -v R="$RST" \
-        -v G="$GRN" -v Y="$YLW" -v Rd="$RED" -v CD="$common_dir" '
-        function tobytes(s,   n, u) {
-            u = substr(s, length(s) - 1, 2)
-            if (u == "KB") return (substr(s, 1, length(s) - 2) + 0) * 1024
-            if (u == "MB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 2
-            if (u == "GB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 3
-            if (u == "TB") return (substr(s, 1, length(s) - 2) + 0) * 1024 ^ 4
-            return (substr(s, 1, length(s) - 1) + 0)
-        }
-        {
-            bytes = tobytes($2)
-            if (bytes >= 150 * 1024 ^ 2)      sc = G
-            else if (bytes >= 20 * 1024 ^ 2)  sc = Y
-            else                              sc = Rd
-
-            n = split($3, parts, "/")
-            fname = parts[n]
-            dir = ""
-            if (CD == "") for (k = 1; k < n; k++) dir = dir parts[k] "/"
-
-            # pull the episode tag (S01E07, s1e7, ...) out of the path so
-            # it reads as its own glanceable column instead of forcing a
-            # scan through an otherwise-identical release-name filename
-            tag = ""
-            if (match($3, /[Ss][0-9][0-9]?[Ee][0-9][0-9]?[0-9]?/))
-                tag = toupper(substr($3, RSTART, RLENGTH))
-
-            sizecol = sprintf("%s%-9s%s", sc, $2, R)
-            if (tag != "") {
-                tagcol  = sprintf("%s%-7s%s", B, tag, R)
-                pathcol = sprintf("%s%s%s%s", D, dir, fname, R)
-            } else {
-                tagcol  = sprintf("%-7s", "")
-                pathcol = sprintf("%s%s%s%s%s%s", D, dir, R, B, fname, R)
-            }
-            printf "%s\t%s\t%s\t%s\n", $1, sizecol, tagcol, pathcol
-        }' \
-    | fzf --ansi --reverse --height=80% --border=rounded --margin=1,2 \
-          --delimiter='\t' --with-nth=2,3,4 \
-          $fzf_extra \
-          --header="$header" \
-          --header-first
-}
-
-# live torrent dashboard while streaming or downloading — wt.js emits one
-# "PEERS\t..." (per-wire detail) plus one "STATUS\t..." line per second to
-# wt.log; redraw a fixed-height block in place from the newest pair. Runs
-# as a background job (RENDER_PID); stop_render tears it down and clears
-# the block. Fixed height + \033[K on every line means redraws never leave
-# artifacts behind, whatever the peer count does
-DASH_H=15
-BAR_W=30
-
-# multibyte-safe truncation — awk counts characters under a UTF-8 locale,
-# while bash 3.2's ${s:0:n} counts bytes when no locale is set and would
-# cut a Unicode char in half
-cutw() {
-    LC_ALL=en_US.UTF-8 awk -v w="$2" '{ s = $0
-        if (length(s) > w) s = substr(s, 1, w - 1) "…"
-        printf "%s", s }' <<< "$1" 2>/dev/null || printf '%s' "$1"
-}
-
-# speed samples as one space-separated string (KB/s) -> block-character
-# sparkline. Takes the samples as $1, not stdin: a background job's stdin
-# is /dev/null, so an awk-without-file here would silently print nothing.
-# Block chars are split on "|" instead of sliced with substr, which is
-# byte-based under the C locale and would mangle them — same reason the
-# progress bar below is built char-by-char in bash
-spark() {
-    awk -v vals="$1" -v B='▁|▂|▃|▄|▅|▆|▇|█' 'BEGIN {
-        n = split(B, ch, "|")
-        max = 0
-        m = split(vals, v, " ")
-        for (i = 1; i <= m; i++) if ((v[i] + 0) > max) max = v[i] + 0
-        out = ""
-        for (i = 1; i <= m; i++) {
-            lvl = max > 0 ? int((v[i] + 0) / max * (n - 1) + 0.5) : 0
-            out = out ch[lvl + 1]
-        }
-        printf "%s", out
-    }'
-}
-
-render_status() {  # $1 = STREAMING|DOWNLOADING   $2 = what's fetched   $3 = torrent title
-    local mode="$1" what="$2" title="$3"
-    local i=0 line peerline peers pct down total speed up upl eta ratio known
-    local filled empty k chunk bar pc hist kb addr client d u have slot el
-    local tw=118 peak hv hc
-    SECONDS=0
-    hist=$(printf '0 %.0s' $(seq 1 42))
-    printf '\033[?25l'
-    trap 'printf "\033[?25h"' TERM
-    while :; do
-        line="$( { tail -n 12 "$WORK/wt.log" 2>/dev/null || true; } | awk 'index($0, "STATUS\t") == 1 { l = $0 } END { print l }' )"
-        peerline="$( { tail -n 12 "$WORK/wt.log" 2>/dev/null || true; } | awk 'index($0, "PEERS\t") == 1 { l = $0 } END { print l }' )"
-        peers=0 pct=0 down="0.0B" total="0.0B" speed="0.0B/s"
-        up="0.0B/s" upl="0.0B" eta="∞" ratio="0.00" known=0
-        case "$line" in
-            STATUS*)
-                IFS=$'\t' read -r _ peers pct down total speed up upl eta ratio known <<< "$line"
-                ;;
-        esac
-        case "$pct"   in ''|*[!0-9]*) pct=0 ;;   esac
-        case "$peers" in ''|*[!0-9]*) peers=0 ;; esac
-        case "$known" in ''|*[!0-9]*) known=0 ;; esac
-
-        # speed history — last 42 samples, converted to KB/s, for the sparkline
-        kb="$(awk -v s="${speed%/s}" 'BEGIN{ v=s+0; u=s; sub(/^[0-9.]+/,"",u); m=(u~/^KB/)?1024:(u~/^MB/)?1048576:(u~/^GB/)?1073741824:1; printf "%.0f", v*m/1024 }')"
-        hist="$(printf '%s' "$hist" | awk -v add="$kb" '{ for (i = 2; i <= NF; i++) printf "%s ", $i; printf "%s", add }')"
-        # scale for the sparkline's dim peak label — max sample, back to human
-        peak="$(printf '%s' "$hist" | awk '{ m = 0; for (i = 1; i <= NF; i++) if (($i + 0) > m) m = $i + 0; printf "%.1f", m * 1024 / 1048576 }')"
-        # re-check the terminal width every ~5s: a window shrunk mid-run must
-        # not wrap lines past the fixed dashboard height and smear the redraw.
-        # stty size < /dev/tty, not tput cols — inside $( ) tput's stdout is
-        # a pipe, so it can't ioctl the terminal and falls back to terminfo
-        if [ $((i % 10)) -eq 0 ]; then
-            c="$(stty size < /dev/tty 2>/dev/null | cut -d' ' -f2)"
-            case "$c" in
-                ''|*[!0-9]*) ;;  # keep the last known width
-                *) tw=$(awk -v c="$c" 'BEGIN{ w = 118
-                        if (w > c - 2) w = c - 2
-                        if (w < 20) w = 20
-                        printf "%d", w }') ;;
-            esac
-        fi
-
-        [ "$i" -gt 0 ] && printf '\033[%dA' "$DASH_H"
-        # stop_render only erases a block that actually started: killing the
-        # renderer before its first frame must not wipe unrelated output
-        : > "$WORK/render.frame"
-        filled=$(( pct * BAR_W / 100 )); empty=$(( BAR_W - filled ))
-        # built char-by-char in bash, not via `tr`: `tr` mangles multi-byte
-        # UTF-8 under the C locale (the common default when a shell has no
-        # LANG/LC_ALL set), turning the block characters into invalid garbage
-        chunk=""; for ((k = 0; k < filled; k++)); do chunk+="█"; done
-        bar="${GRN}${chunk}"
-        chunk=""; for ((k = 0; k < empty; k++)); do chunk+="░"; done
-        bar+="${DIM}${chunk}${RST}"
-        if [ "$peers" -eq 0 ]; then pc="$RED"
-        elif [ "$peers" -lt 5 ]; then pc="$YLW"
-        else pc="$GRN"; fi
-        # 59s … 1h02m — hour form reads better than 62m13s on long downloads
-        el="$((SECONDS / 3600))h$(printf '%02d' $((SECONDS % 3600 / 60)))m"
-        [ "$SECONDS" -lt 3600 ] && el="$((SECONDS / 60))m$(printf '%02d' $((SECONDS % 60)))s"
-
-        printf '%s%s%s  %s%s%s  %st %s%s\033[K\n' \
-            "$CYN" "${SPIN[$((i % 10))]}" "$RST" "$BLD" "$mode" "$RST" "$DIM" "$el" "$RST"
-        printf '  %s%s%s\033[K\n' "$BLD" "$(cutw "$title" "$tw")" "$RST"
-        printf '  %s%s%s\033[K\n' "$DIM" "$(cutw "$what" "$tw")" "$RST"
-        printf '  %s  %s%3s%%%s\033[K\n' "$bar" "$BLD" "$pct" "$RST"
-        printf '  %s↓ %s%s   %s↑ %s%s   %sratio %s%s\033[K\n' \
-            "$CYN" "$speed" "$RST" "$YLW" "$up" "$RST" "$DIM" "$ratio" "$RST"
-        printf '  %s%s / %s downloaded   %s uploaded   %seta %s%s%s\033[K\n' \
-            "$DIM" "$down" "$total" "$upl" "$RST" "$BLD" "$eta" "$RST"
-        printf '  %s%s%s %speak %sMB/s%s\033[K\n' \
-            "$CYN" "$(spark "$hist")" "$RST" "$DIM" "$peak" "$RST"
-        printf '  %speers%s %s%s%s / %s%s known%s\033[K\n' \
-            "$BLD" "$RST" "$pc" "$peers" "$RST" "$DIM" "$known" "$RST"
-        if [ "$tw" -ge 90 ]; then
-            printf '  %s%-21s %-16s %9s %9s  %6s%s\033[K\n' \
-                "$DIM" ip client down up have% "$RST"
-        elif [ "$tw" -ge 60 ]; then
-            printf '  %s%-18s %9s %9s  %6s%s\033[K\n' \
-                "$DIM" ip down up have% "$RST"
-        else
-            printf '  %s%9s %9s  %6s%s\033[K\n' \
-                "$DIM" down up have% "$RST"
-        fi
-        slot=0
-        if [ -n "$peerline" ]; then
-            while IFS= read -r p; do
-                [ -n "$p" ] || continue
-                IFS='|' read -r addr client d u have <<< "$p"
-                slot=$((slot + 1))
-                [ "$slot" -le 6 ] || break
-                # seed maturity: full copy, partial, nothing yet
-                hv="${have%%%}"
-                case "$hv" in ''|*[!0-9]*) hv=0 ;; esac
-                if [ "$hv" -ge 100 ]; then hc="$GRN"
-                elif [ "$hv" -gt 0 ]; then hc="$YLW"
-                else hc="$DIM"; fi
-                if [ "$tw" -ge 90 ]; then
-                    printf '  %-21s %s%-16s%s %9s %9s  %s%6s%s\033[K\n' \
-                        "$(cutw "$addr" 21)" "$DIM" "$(cutw "$client" 16)" "$RST" "$d" "$u" "$hc" "$have" "$RST"
-                elif [ "$tw" -ge 60 ]; then
-                    printf '  %-18s %9s %9s  %s%6s%s\033[K\n' \
-                        "$(cutw "$addr" 18)" "$d" "$u" "$hc" "$have" "$RST"
-                else
-                    printf '  %9s %9s  %s%6s%s\033[K\n' \
-                        "$d" "$u" "$hc" "$have" "$RST"
-                fi
-            done <<< "$(printf '%s' "$peerline" | sed $'s/^PEERS\t//' | tr ';' '\n')"
-        fi
-        if [ "$slot" -eq 0 ] && [ "$peers" -eq 0 ]; then
-            # dead first seconds made the dashboard look stuck — say why
-            printf '  %scontacting swarm…%s\033[K\n' "$DIM" "$RST"
-            slot=1
-        fi
-        while [ "$slot" -lt 6 ]; do
-            slot=$((slot + 1))
-            printf '\033[K\n'
-        done
-        i=$((i + 1))
-        sleep 0.5
-    done
-}
-
+RC=0
 if [ "$MODE" = "stream" ]; then
-    PLAYER=""
-    IINA_CLI=""
-    if [ -x /Applications/IINA.app/Contents/MacOS/iina-cli ] || command -v iina-cli >/dev/null 2>&1; then
-        PLAYER="iina"
-        IINA_CLI="$(command -v iina-cli || echo /Applications/IINA.app/Contents/MacOS/iina-cli)"
-    elif command -v mpv >/dev/null 2>&1; then
-        PLAYER="mpv"
-    elif command -v vlc >/dev/null 2>&1; then
-        PLAYER="vlc"
-    else
-        printf '  no supported player found (iina / mpv / vlc)\n' >&2
-        exit 1
-    fi
-
-    FALLBACK_STREAM() {
-        printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
-        webtorrent "$MAGNET" "--$PLAYER" -i
-        exit $?
-    }
-
-    # wait for the webtorrent http server and find its real port: the
-    # process also opens a bittorrent wire socket that accepts connections
-    # without ever speaking http, so probe each listening port with a
-    # request for /webtorrent/favicon.ico (answers 404 as soon as the
-    # server is up — no data needed)
-    wait_stream_port() {
-        local pid="$1" i p code ports
-        for i in $(seq 1 30); do
-            ports="$(lsof -nP -p "$pid" -a -iTCP -sTCP:LISTEN 2>/dev/null \
-                | awk '/LISTEN/{gsub(".*:", "", $9); print $9}' | sort -u)"
-            for p in $ports; do
-                code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' \
-                    "http://127.0.0.1:$p/webtorrent/favicon.ico" 2>/dev/null || true)"
-                if [ "$code" != "000" ] && [ -n "$code" ]; then
-                    printf '%s' "$p"
-                    return 0
-                fi
-            done
-            sleep 0.5
-        done
-        return 1
-    }
-
-    # can't read the torrent's file list, no video files found, or no
-    # selective-download runner — fall back to webtorrent's own picker
-    if [ ! -s "$WORK/files.tsv" ] || [ "$N_VIDS" -eq 0 ] || [ -z "$WTMOD" ]; then
-        FALLBACK_STREAM "couldn't read the file list — falling back to webtorrent's picker"
-    fi
-
-    if [ "$N_VIDS" -eq 1 ]; then
-        VID_IDX="$(printf '%s' "$VIDS" | cut -f1)"
-    else
-        printf '  %smultiple video files — pick one%s\n\n' "$BLD" "$RST"
-        PICKED="$(pick_video "$VIDS")"
-        [ -n "$PICKED" ] || exit 0
-        VID_IDX="$(printf '%s\n' "$PICKED" | sed $'s/\x1b\\[[0-9;]*m//g' | grep -E '^[0-9]+\t' | cut -f1 | tr -d ' ')"
-    fi
-    VID_PATH="$(awk -F'\t' -v i="$VID_IDX" '$1 == i {print $3}' "$WORK/files.tsv")"
-
-    # look for a subtitle already inside this torrent that matches the
-    # picked video — free, no rate limit, and guaranteed to be timed for
-    # this exact release, unlike an external subtitle API. Exact filename
-    # match beats "same stem plus a language suffix" beats "just in the
-    # same folder"; anything scoring 0 (no candidate at all) is skipped
-    # rather than guessing and attaching the wrong episode's subtitle
-    SUB_MATCH="$(awk -F'\t' -v vidpath="$VID_PATH" '
-        BEGIN {
-            dir = vidpath; sub(/[^\/]*$/, "", dir); dir = tolower(dir)
-            base = vidpath; sub(/.*\//, "", base)
-            stem = base; sub(/\.[^.]*$/, "", stem); stem = tolower(stem)
-        }
-        {
-            path = $3; lc = tolower(path)
-            if (lc !~ /\.(srt|ass|ssa|vtt)$/) next
-            cbase = path; sub(/.*\//, "", cbase)
-            cstem = cbase; sub(/\.[^.]*$/, "", cstem); cstem = tolower(cstem)
-            cdir = path; sub(/[^\/]*$/, "", cdir); cdir = tolower(cdir)
-            score = 0
-            if (cstem == stem) score = 3
-            else if (index(cstem, stem) == 1) score = 2
-            else if (cdir == dir) score = 1
-            if (score == 0) next
-            bonus = (cstem ~ /(^|[._-])(en|eng|english)([._-]|$)/) ? 1 : 0
-            total = score * 10 + bonus
-            if (total > best) { best = total; bi = $1; bp = path }
-        }
-        END { if (bi != "") printf "%s\t%s\n", bi, bp }
-    ' "$WORK/files.tsv")"
-    SUB_IDX="" SUB_TORRENT_PATH="" SUB_PATH=""
-    if [ -n "$SUB_MATCH" ]; then
-        SUB_IDX="${SUB_MATCH%%$'\t'*}"
-        SUB_TORRENT_PATH="${SUB_MATCH#*$'\t'}"
-    fi
-    SERVE_SEL="$VID_IDX"
-    [ -n "$SUB_IDX" ] && SERVE_SEL="$VID_IDX,$SUB_IDX"
-
-    # run a quiet wt.js stream server and launch the player ourselves:
-    # webtorrent's own --iina opens IINA via URL scheme, which doesn't give
-    # us a way to know when playback ends (needed to clean up the temp dir),
-    # so we drive both the server and the player directly for one
-    # consistent, controllable launch path
-    # the meta phase names the .torrent file after the info hash, so the
-    # hash is right there in $META's basename — no json parse, no python
-    INFOHASH="${META##*/}"
-    INFOHASH="${INFOHASH%.torrent}"
-    URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$VID_PATH")"
-    node "$LIB_DIR/wt.js" "$WTMOD" serve "$META" "$WORK/stream" \
-        "$SERVE_SEL" "$OPTS_JSON" 0 >"$WORK/wt.log" 2>&1 &
-    WT_PID=$!
-    # the runner prints PORT=<n> once listening (falls back to any free port
-    # if our requested one was taken); verify it actually serves http
-    for i in $(seq 1 40); do
-        PORT="$(sed -n 's/^PORT=//p' "$WORK/wt.log" 2>/dev/null | head -1)"
-        [ -n "$PORT" ] && break
-        kill -0 "$WT_PID" 2>/dev/null || break
-        sleep 0.25
-    done
-    if [ -z "$PORT" ]; then
-        PORT="$(wait_stream_port "$WT_PID" || true)"
-    fi
-    if [ -z "$PORT" ]; then
-        FALLBACK_STREAM "stream server didn't start ($(tail -2 "$WORK/wt.log" 2>/dev/null | tr '\n' ' ')) — falling back to webtorrent's picker"
-    fi
-    STREAM_URL="http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$URLPATH"
-
-    # the subtitle is served the same way as the video — pull it from our
-    # own stream server (which pulls it from the swarm, prioritized by the
-    # select() call in wt.js) rather than an external service. It's tiny,
-    # so this is normally near-instant; capped so a slow swarm can never
-    # hold up playback for long
-    if [ -n "$SUB_IDX" ]; then
-        SUB_URLPATH="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$SUB_TORRENT_PATH")"
-        # keep the original torrent filename locally too — a generic name
-        # like "sub.srt" is what IINA's subtitle picker would then show,
-        # which is indistinguishable from an unrelated or empty file at a
-        # glance; the real name makes it obviously the right one
-        SUB_BASENAME="$(basename "$SUB_TORRENT_PATH")"
-        if curl -fsS -m 8 -o "$WORK/$SUB_BASENAME" \
-                "http://127.0.0.1:$PORT/webtorrent/$INFOHASH/$SUB_URLPATH" 2>"$WORK/subs.err"; then
-            SUB_PATH="$WORK/$SUB_BASENAME"
-            printf '  %ssubtitles: %s%s\n' "$DIM" "$SUB_BASENAME" "$RST"
-            [ "${SAIL_DEBUG:-0}" = 1 ] && printf '  %s(saved to %s, %s bytes)%s\n' \
-                "$DIM" "$SUB_PATH" "$(wc -c < "$SUB_PATH" | tr -d ' ')" "$RST" >&2
-        elif [ "${SAIL_DEBUG:-0}" = 1 ]; then
-            printf '  %ssubtitles: failed to fetch %s%s\n' "$DIM" "$SUB_TORRENT_PATH" "$RST" >&2
-            [ -s "$WORK/subs.err" ] && sed 's/^/    /' "$WORK/subs.err" >&2
-        fi
-    fi
-
-    printf '  streaming — quit the player to stop\n\n'
-    render_status "STREAMING" "file: $(basename "$VID_PATH")" "$SEL_TITLE" &
-    RENDER_PID=$!
-    case "$PLAYER" in
-        iina) if [ -n "$SUB_PATH" ]; then
-                  # verified against IINA's own mpv IPC socket (track-list /
-                  # sid), not just guessed: --mpv-sub-file (CLI-only alias)
-                  # and --mpv-sub-files-append both get silently dropped by
-                  # IINA's option relay — the append variant never even
-                  # appears in track-list. The plain "set" form, --mpv-sub-
-                  # files (no -append), is what actually gets applied and
-                  # auto-selected (confirmed selected:true, sid:1)
-                  "$IINA_CLI" --keep-running --mpv-sub-files="$SUB_PATH" "$STREAM_URL"
-              else
-                  "$IINA_CLI" --keep-running "$STREAM_URL"
-              fi ;;
-        mpv)  if [ -n "$SUB_PATH" ]; then
-                  mpv --sub-file="$SUB_PATH" "$STREAM_URL"
-              else
-                  mpv "$STREAM_URL"
-              fi ;;
-        vlc)  if [ -n "$SUB_PATH" ]; then
-                  vlc --sub-file="$SUB_PATH" "$STREAM_URL"
-              else
-                  vlc "$STREAM_URL"
-              fi ;;
-    esac
-    # player closed — the EXIT trap kills the webtorrent server and wipes
-    # $WORK (including the streamed video)
-    exit $?
-
+    sail_stream "$MAGNET" "$META" "$SEL_TITLE" || RC=$?
 else
-    FALLBACK_DOWNLOAD() {
-        printf '  %s%s%s\n\n' "$YLW" "$1" "$RST"
-        # foreground, not exec: exec would replace the shell and skip the
-        # EXIT trap (temp dir cleanup, renderer/server teardown)
-        local rc=0
-        webtorrent "$MAGNET" --out "$DOWNLOAD_DIR" -i || rc=$?
-        exit "$rc"
-    }
-
-    # can't read the torrent's file list, no video files found, or no
-    # selective-download runner — fall back to webtorrent's own downloader
-    # (this downloads the whole torrent; it's the only option without a
-    # file list to choose from)
-    if [ ! -s "$WORK/files.tsv" ] || [ "$N_VIDS" -eq 0 ] || [ -z "$WTMOD" ]; then
-        FALLBACK_DOWNLOAD "couldn't read the file list — downloading the whole torrent"
-    fi
-
-    if [ "$N_VIDS" -eq 1 ]; then
-        SEL_IDXS="$(printf '%s' "$VIDS" | cut -f1)"
-    else
-        printf '  %spick episodes to download%s\n\n' "$BLD" "$RST"
-        PICKED="$(pick_video "$VIDS" multi)"
-        [ -n "$PICKED" ] || exit 0
-        SEL_IDXS="$(printf '%s\n' "$PICKED" | sed $'s/\x1b\\[[0-9;]*m//g' | grep -E '^[0-9]+\t' | cut -f1 | tr -d ' ' | paste -sd, -)"
-    fi
-    N_SEL=$(( $(printf '%s' "$SEL_IDXS" | tr -cd ',' | wc -c) + 1 ))
-
-    printf '  downloading %s%d file%s%s to %s%s%s\n\n' \
-        "$BLD" "$N_SEL" "$([ "$N_SEL" = 1 ] || printf s)" "$RST" "$CYN" "$DOWNLOAD_DIR" "$RST"
-    SECONDS=0
-    node "$LIB_DIR/wt.js" "$WTMOD" get "$META" "$DOWNLOAD_DIR" \
-        "$SEL_IDXS" "$OPTS_JSON" >"$WORK/wt.log" 2>&1 &
-    WT_PID=$!
-    render_status "DOWNLOADING" "$N_SEL file$([ "$N_SEL" = 1 ] || printf s) to $DOWNLOAD_DIR" "$SEL_TITLE" &
-    RENDER_PID=$!
-    WT_STATUS=0
-    wait "$WT_PID" || WT_STATUS=$?
-    WT_PID=""
-    stop_render
-    ELAPSED="$((SECONDS / 3600))h$(printf '%02d' $((SECONDS % 3600 / 60)))m"
-    [ "$SECONDS" -lt 3600 ] && ELAPSED="$((SECONDS / 60))m$(printf '%02d' $((SECONDS % 60)))s"
-    if [ "$WT_STATUS" -eq 0 ]; then
-        printf '  %sdone%s in %s — saved to %s%s%s\n' \
-            "$GRN" "$RST" "$ELAPSED" "$CYN" "$DOWNLOAD_DIR" "$RST"
-        notify "sail" "Download complete: $SEL_TITLE"
-    else
-        printf '  %sdownload didn'"'"'t finish cleanly (%s)%s\n' "$RED" "$WT_STATUS" "$RST"
-        # wt.log holds the real webtorrent error — show it, don't just exit
-        if [ -s "$WORK/wt.log" ]; then
-            tail -3 "$WORK/wt.log" | while IFS= read -r wl; do
-                printf '  %s%s%s\n' "$DIM" "$(cutw "$wl" 118)" "$RST"
-            done
-        fi
-        notify "sail" "Download failed: $SEL_TITLE"
-    fi
+    sail_download "$MAGNET" "$META" "$SEL_TITLE" "$DOWNLOAD_DIR" || RC=$?
 fi
+exit "$RC"

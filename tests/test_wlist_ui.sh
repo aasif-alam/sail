@@ -10,6 +10,10 @@
 set -euo pipefail
 
 if ! command -v tmux >/dev/null 2>&1; then
+    if [ -n "${CI:-}" ]; then
+        printf 'tmux not installed — CI requires it\n' >&2
+        exit 1
+    fi
     printf 'skip: tmux not installed\n'
     exit 0
 fi
@@ -47,7 +51,7 @@ Old One	magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=old	1760
 New Two	magnet:?xt=urn:btih:2222222222222222222222222222222222222222&dn=new	1760100000
 T
 run "$W/w1"
-pane | grep -q "enter: launch" && ok "picker renders" || fail "picker renders"
+if pane | grep -q "enter: launch"; then ok "picker renders"; else fail "picker renders"; fi
 # the id column is hidden from display (--with-nth), so assert order by
 # where the titles land on screen
 NL1="$(pane | grep -n "New Two" | head -1 | cut -d: -f1)"
@@ -59,13 +63,15 @@ else
 fi
 send Enter
 for _ in $(seq 1 20); do pane | grep -q "stream or download" && break; sleep 0.5; done
-pane | grep -q "stream or download? \[S/d/q\]" \
-    && ok "enter launches to stream/download prompt" \
-    || fail "enter launches"
+if pane | grep -q "stream or download? \[S/d/q\]"; then
+    ok "enter launches to stream/download prompt"
+else
+    fail "enter launches"
+fi
 send q
 send Enter
 for _ in $(seq 1 10); do pane | grep -q "SAIL_EXITED" && break; sleep 0.5; done
-pane | grep -q "SAIL_EXITED" && ok "q quits from the launch prompt" || fail "q quits"
+if pane | grep -q "SAIL_EXITED"; then ok "q quits from the launch prompt"; else fail "q quits"; fi
 die
 
 # --- 2. ctrl-x removes the picked entry; the rest of the list survives
@@ -109,7 +115,7 @@ T
 run "$W/w4"
 send Escape
 for _ in $(seq 1 10); do pane | grep -q "SAIL_EXITED" && break; sleep 0.5; done
-pane | grep -q "SAIL_EXITED" && ok "esc quits" || fail "esc quits"
+if pane | grep -q "SAIL_EXITED"; then ok "esc quits"; else fail "esc quits"; fi
 die
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

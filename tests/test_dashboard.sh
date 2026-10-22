@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression tests for bin/sail's stop_render.
+# Regression tests for lib/dashboard.sh's stop_render.
 #
 # stop_render SIGKILLs the dashboard renderer and then reaps it. That reaping
 # `wait` returns 137, and under `set -e` a bare wait aborted the function
@@ -7,7 +7,7 @@
 # exiting 137. It also never cleared RENDER_PID, so the EXIT trap cleared the
 # block a second time.
 #
-# The function is extracted from the real script (rather than copied here) so
+# The function is extracted from the real module (rather than copied here) so
 # these tests fail if the shipped code regresses.
 set -euo pipefail
 
@@ -19,9 +19,9 @@ fail() { FAIL=$((FAIL + 1)); printf 'FAIL %s\n' "$1"; }
 
 W="$(mktemp -d)"
 cleanup() {
-    for p in "$W"/rpid; do
-        [ -f "$p" ] && kill -9 "$(cat "$p")" 2>/dev/null || true
-    done
+    if [ -f "$W/rpid" ]; then
+        kill -9 "$(cat "$W/rpid")" 2>/dev/null || true
+    fi
     rm -rf "$W"
 }
 trap cleanup EXIT
@@ -34,7 +34,8 @@ start_renderer() {  # prints the pid of a process that ignores TERM
 # extract the function exactly as shipped: from its definition to the first
 # closing brace in column 1
 awk '/^stop_render\(\) \{/ { copy = 1 } copy { print } copy && /^\}/ { exit }' \
-    bin/sail > "$W/stop_render.sh"
+    lib/dashboard.sh > "$W/stop_render.sh"
+# shellcheck disable=SC2016  # the single-quoted $pid is the point
 if ! grep -q 'wait "\$pid".*|| true' "$W/stop_render.sh"; then
     fail "stop_render uses an errexit-safe wait"
 else
@@ -113,6 +114,25 @@ if [ "$CLEARS" -eq 0 ] && grep -q $'\033\[?25h' "$W/out3"; then
     ok "no frame drawn: cursor restored, nothing erased"
 else
     fail "no frame drawn: clears=$CLEARS out=[$(cat "$W/out3")]"
+fi
+
+# --- 4. a short terminal: erase the height the renderer actually used -----
+cat > "$W/case4.sh" <<'EOF'
+set -euo pipefail
+. "$1/stop_render.sh"
+WORK="$2"; mkdir -p "$WORK"; : > "$WORK/render.frame"
+printf '11\n' > "$WORK/render.h"
+DASH_H=15
+bash -c 'trap "" TERM; sleep 30' &
+RENDER_PID=$!
+stop_render > "$3"
+EOF
+bash "$W/case4.sh" "$W" "$W/work4" "$W/out4" > /dev/null 2>"$W/stderr4" || true
+CLEARS="$(grep -o $'\033\[11A' "$W/out4" | wc -l | tr -d ' ' || true)"
+if [ "$CLEARS" -eq 1 ] && [ ! -f "$W/work4/render.h" ]; then
+    ok "render.h height is used and cleaned up"
+else
+    fail "render.h height ignored: clears=$CLEARS"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

@@ -113,6 +113,30 @@ class SearchYtsTest(unittest.TestCase):
         mock_json.return_value = {"data": {}}
         self.assertEqual(search.search_yts("nothing"), [])
 
+    @mock.patch("search.http_json")
+    def test_age_comes_from_upload_time(self, mock_json):
+        when = int(time.time() - 3 * 86400)
+        mock_json.return_value = {"data": {"movies": [{
+            "title": "Example", "year": 2024, "title_long": "Example (2024)",
+            "date_uploaded_unix": when,
+            "torrents": [{"quality": "1080p", "type": "web", "seeds": 5,
+                          "size": "2.1 GB", "hash": "H1"}],
+        }]}}
+        results = search.search_yts("example")
+        self.assertEqual(results[0]["age"], "3d ago")
+
+    @mock.patch("search.http_json")
+    def test_age_falls_back_to_torrent_upload_time(self, mock_json):
+        when = int(time.time() - 2 * 86400)
+        mock_json.return_value = {"data": {"movies": [{
+            "title": "Example", "year": 2024, "title_long": "Example (2024)",
+            "torrents": [{"quality": "1080p", "type": "web", "seeds": 5,
+                          "size": "2.1 GB", "hash": "H1",
+                          "date_uploaded_unix": when}],
+        }]}}
+        results = search.search_yts("example")
+        self.assertEqual(results[0]["age"], "2d ago")
+
 
 class SearchTorrentsCsvTest(unittest.TestCase):
     @mock.patch("search.http_json")
@@ -206,18 +230,128 @@ class Search1337xTest(unittest.TestCase):
         self.assertTrue(results[0]["magnet"].startswith("FETCH:https://"))
 
 
+def _row(title="Result", seeders=10, magnet="magnet:?xt=urn:btih:H"):
+    return {"title": title, "seeders": seeders, "size": "1.0GB",
+            "source": "tpb", "age": "1d ago", "magnet": magnet}
+
+
 class SourceErrorOutputTest(unittest.TestCase):
-    def test_errors_print_even_when_other_results_exist(self):
+    def test_all_sources_failing_exits_2_with_summary(self):
         import io
 
         def boom(_query):
             raise RuntimeError("kABOOM")
 
         with mock.patch.object(search, "ALL_SOURCES", {"boom": boom}), \
-             mock.patch.object(sys, "argv", ["search.py", "--sources=boom", "x"]), \
+             mock.patch.object(sys, "argv",
+                               ["search.py", "--sources=boom", "x"]), \
              mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as cm:
+                search.main()
+        self.assertEqual(cm.exception.code, 2)
+        out = err.getvalue()
+        self.assertIn("[source error] boom: kABOOM", out)
+        self.assertIn("[sources] 1 of 1 unavailable", out)
+
+    def test_partial_failure_prints_summary_but_succeeds(self):
+        import io
+
+        def boom(_query):
+            raise RuntimeError("timed out")
+
+        def good(_query):
+            return [_row()]
+
+        with mock.patch.object(search, "ALL_SOURCES",
+                               {"boom": boom, "good": good}), \
+             mock.patch.object(sys, "argv",
+                               ["search.py", "--sources=boom,good", "x"]), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out, \
+             mock.patch.object(sys, "stderr", new_callable=io.StringIO) as err:
+            search.main()  # no SystemExit: at least one source worked
+        self.assertIn("Result", out.getvalue())
+        self.assertIn("[sources] 1 of 2 unavailable", err.getvalue())
+
+    def test_no_enabled_sources_exits_3(self):
+        import io
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf") as f:
+            path = f.name
+            with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}), \
+                 mock.patch.object(sys, "argv", ["search.py", "x"]), \
+                 mock.patch.object(sys, "stderr",
+                                   new_callable=io.StringIO) as err:
+                with self.assertRaises(SystemExit) as cm:
+                    search.main()
+        self.assertEqual(cm.exception.code, 3)
+        self.assertIn("no sources enabled", err.getvalue())
+
+
+class ResultPipelineTest(unittest.TestCase):
+    def test_filter_relevant_requires_every_significant_word(self):
+        results = [_row("Ubuntu Server 24.04"), _row("Ubuntu Desktop"),
+                   _row("Debian Server")]
+        out = search.filter_relevant(results, "ubuntu server")
+        self.assertEqual([r["title"] for r in out], ["Ubuntu Server 24.04"])
+
+    def test_filter_relevant_ignores_short_words(self):
+        self.assertEqual(len(search.filter_relevant([_row()], "a b c")), 1)
+
+    def test_dedupe_keeps_best_seeded_copy_and_sorts(self):
+        results = [_row("Same Title", 5), _row("same title", 50),
+                   _row("Other", 20)]
+        out = search.dedupe_sorted(results)
+        self.assertEqual([r["title"] for r in out], ["same title", "Other"])
+        self.assertEqual(out[0]["seeders"], 50)
+
+    def test_tsv_rows_have_exactly_seven_fields(self):
+        rows = search.to_rows([_row("Bad\tTitle\nHere",
+                                    magnet="magnet:?xt=urn:btih:H\tx")])
+        tsv = search.to_tsv(rows)
+        lines = tsv.splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(len(lines[0].split("\t")), 7)
+        self.assertEqual(rows[0]["title"], "Bad Title Here")
+
+    def test_json_has_all_columns(self):
+        rows = search.to_rows([_row()])
+        parsed = json.loads(search.to_json(rows))
+        self.assertEqual(set(parsed[0]),
+                         {"id", "seeders", "size", "source", "title",
+                          "age", "magnet"})
+
+
+class MagnetFromDetailTest(unittest.TestCase):
+    @mock.patch("search.http_get")
+    def test_extracts_and_unescapes_magnet(self, mock_get):
+        mock_get.return_value = (
+            '<a href="magnet:?xt=urn:btih:ABC&amp;dn=Show">m</a>')
+        self.assertEqual(search.magnet_from_detail("https://example/x"),
+                         "magnet:?xt=urn:btih:ABC&dn=Show")
+
+    @mock.patch("search.http_get")
+    def test_missing_magnet_raises(self, mock_get):
+        mock_get.return_value = "<html>gone</html>"
+        with self.assertRaises(RuntimeError):
+            search.magnet_from_detail("https://example/x")
+
+
+class JsonModeTest(unittest.TestCase):
+    def test_json_mode_prints_a_parseable_array(self):
+        import io
+
+        def good(_query):
+            return [_row()]
+
+        with mock.patch.object(search, "ALL_SOURCES", {"good": good}), \
+             mock.patch.object(sys, "argv",
+                               ["search.py", "--json", "--sources=good", "x"]), \
+             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out, \
+             mock.patch.object(sys, "stderr", new_callable=io.StringIO):
             search.main()
-        self.assertIn("[source error] boom: kABOOM", err.getvalue())
+        parsed = json.loads(out.getvalue())
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["title"], "Result")
 
 
 class LoadEnabledTest(unittest.TestCase):
@@ -254,6 +388,35 @@ class LoadEnabledTest(unittest.TestCase):
         try:
             with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}):
                 self.assertEqual(search.load_enabled(), [])
+        finally:
+            os.unlink(path)
+
+    def test_whitespace_dupes_and_unknowns(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            f.write(" tpb \nnyaa\ntpb\nbogus_source\n")
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}):
+                enabled, unknown = search.read_config()
+                self.assertEqual(enabled, ["tpb", "nyaa"])
+                self.assertEqual(unknown, ["bogus_source"])
+        finally:
+            os.unlink(path)
+
+    def test_enabled_mode_prints_one_name_per_line(self):
+        import io
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
+            f.write("tpb\nnyaa\n")
+            path = f.name
+        try:
+            with mock.patch.dict(os.environ, {"SAIL_SOURCES": path}), \
+                 mock.patch.object(sys, "argv", ["search.py", "--enabled"]), \
+                 mock.patch.object(sys, "stdout",
+                                   new_callable=io.StringIO) as out:
+                search.main()
+            self.assertEqual(out.getvalue(), "tpb\nnyaa\n")
         finally:
             os.unlink(path)
 

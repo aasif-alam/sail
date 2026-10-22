@@ -44,11 +44,16 @@ if [ "$ON" -eq "$NDEFAULT" ] && [ "$OFF" -eq $((N - NDEFAULT)) ]; then
 else
     fail "no config: $ON on / $OFF off (want $NDEFAULT / $((N - NDEFAULT)))"
 fi
-[ ! -e "$CONF" ] && ok "no config: merely viewing creates no file" \
-    || fail "viewing created $CONF"
-printf '%s\n' "$PLAIN" | grep -q "nothing changed" \
-    && ok "no config + save: nothing written" \
-    || fail "expected 'nothing changed'"
+if [ ! -e "$CONF" ]; then
+    ok "no config: merely viewing creates no file"
+else
+    fail "viewing created $CONF"
+fi
+if printf '%s\n' "$PLAIN" | grep -q "nothing changed"; then
+    ok "no config + save: nothing written"
+else
+    fail "expected 'nothing changed'"
+fi
 
 # --- 2. existing empty config: every source off, and search uses none ------
 : > "$CONF"
@@ -84,9 +89,11 @@ if [ "$(count_on "$PLAIN")" -eq 1 ] \
 else
     fail "existing config: wrong selection"
 fi
-[ "$(enabled_in "$CONF")" = "nyaa" ] \
-    && ok "existing config: load_enabled matches the file" \
-    || fail "existing config: load_enabled=[$(enabled_in "$CONF")]"
+if [ "$(enabled_in "$CONF")" = "nyaa" ]; then
+    ok "existing config: load_enabled matches the file"
+else
+    fail "existing config: load_enabled=[$(enabled_in "$CONF")]"
+fi
 
 # --- 5. toggling one default off saves the remaining defaults --------------
 rm -f "$CONF"
@@ -96,6 +103,25 @@ if [ -f "$CONF" ] && ! grep -qx 'tpb' "$CONF" \
     ok "toggle tpb off: file keeps the other defaults"
 else
     fail "toggle tpb off: file=[$(tr '\n' ',' < "$CONF" 2>/dev/null)]"
+fi
+
+# --- 5b. whitespace in the config reads the same way a search reads it -----
+printf '  nyaa  \n\n# comment\n' > "$CONF"
+OUT="$(run_ui "$CONF" q)"
+PLAIN="$(printf '%s\n' "$OUT" | strip)"
+if [ "$(count_on "$PLAIN")" -eq 1 ] \
+   && printf '%s\n' "$PLAIN" | grep -F '[x]' | grep -q 'nyaa'; then
+    ok "padded config name is recognized as enabled"
+else
+    fail "padded config name was missed"
+fi
+# a save rewrites clean names (and leaves no temp file behind)
+run_ui "$CONF" a s >/dev/null
+if grep -qx 'nyaa' "$CONF" && ! grep -Eq '^[[:space:]]|[[:space:]]$' "$CONF" \
+   && ! ls "$CONF".tmp.* >/dev/null 2>&1; then
+    ok "saving normalizes whitespace and leaves no temp file"
+else
+    fail "save left [$(tr '\n' ',' < "$CONF")] or a temp file"
 fi
 
 # --- 6. every box line has the same display width --------------------------

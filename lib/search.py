@@ -4,6 +4,12 @@
 Queries multiple public sources in parallel and prints results as TSV:
     id<TAB>seeders<TAB>size<TAB>source<TAB>title<TAB>age<TAB>magnet
 
+Other modes, all used by bin/sail:
+    --list-sources   name<TAB>description<TAB>enabled-by-default
+    --enabled        one enabled source name per line (the config file,
+                     or the defaults when it is missing)
+    --json           print a JSON array instead of TSV (for `sail --json`)
+
 If a row's magnet is "FETCH:<url>", the caller must fetch the torrent
 detail page to extract the magnet (used for scraped sources like 1337x).
 Uses only the Python standard library.
@@ -167,7 +173,10 @@ def search_yts(query):
                 "seeders": _int(t.get("seeds")),
                 "size": t.get("size", "?"),
                 "source": "yts",
-                "age": "?",
+                # YTS publishes upload times per movie and per torrent;
+                # either is better than the blank column this used to show
+                "age": ago(t.get("date_uploaded_unix")
+                           or m.get("date_uploaded_unix")),
                 "magnet": magnet_from_hash(
                     t["hash"], _clean_title(m.get("title_long") or m["title"])),
             })
@@ -376,7 +385,11 @@ def search_knaben(query):
         if not t:
             continue
         tds = re.findall(r'<td[^>]*>(.*?)</td>', body, re.S)
-        cell = lambda k: re.sub(r"<[^>]+>", " ", tds[k]).strip() if len(tds) > k else "?"
+
+        def cell(k, tds=tds):
+            return (re.sub(r"<[^>]+>", " ", tds[k]).strip()
+                    if len(tds) > k else "?")
+
         out.append({
             "title": _clean_title(t.group(1)),
             "seeders": _int(cell(4)),
@@ -495,24 +508,35 @@ def config_path():
         os.environ.get("SAIL_SOURCES", "~/.config/sail/sources.conf"))
 
 
-def load_enabled():
-    """Enabled source names, exactly as the config file lists them.
+def read_config():
+    """(enabled, unknown) source names from the config file.
 
     A missing file means DEFAULT_ENABLED. An existing file is authoritative
     even when it is empty: that means search no sources (the UI writes an
-    empty file when the user saves with everything toggled off)."""
+    empty file when the user saves with everything toggled off). Unknown
+    names are returned separately so callers can point out a typo instead
+    of silently searching fewer sources."""
     path = config_path()
     if not os.path.exists(path):
-        return list(DEFAULT_ENABLED)
-    enabled = []
+        return list(DEFAULT_ENABLED), []
+    enabled, unknown, seen = [], [], set()
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             if line in ALL_SOURCES:
-                enabled.append(line)
-    return enabled
+                if line not in seen:
+                    seen.add(line)
+                    enabled.append(line)
+            elif line not in unknown:
+                unknown.append(line)
+    return enabled, unknown
+
+
+def load_enabled():
+    """Enabled source names, exactly as the config file lists them."""
+    return read_config()[0]
 
 
 def magnet_from_detail(url):
@@ -524,27 +548,36 @@ def magnet_from_detail(url):
     return html.unescape(m.group(1))
 
 
-def main():
-    argv = sys.argv[1:]
-    if argv and argv[0] == "--list-sources":
-        for name in ALL_SOURCES:
-            default = "1" if name in DEFAULT_ENABLED else "0"
-            print(f"{name}\t{SOURCE_INFO[name]}\t{default}")
-        return
-    if argv and argv[0].startswith("--sources="):
-        enabled = [s for s in argv[0].split("=", 1)[1].split(",")
-                   if s in ALL_SOURCES]
-        argv = argv[1:]
-    else:
-        enabled = load_enabled()
-    if not argv or not " ".join(argv).strip():
-        print("usage: search.py [--sources=a,b,c] <query>", file=sys.stderr)
-        sys.exit(1)
-    query = " ".join(argv).strip()
+def filter_relevant(results, query):
+    """Drop rows missing a significant query word.
 
+    Some sources (e.g. EZTV) ignore the search param and return everything;
+    without this the list fills with unrelated torrents."""
+    tokens = [t for t in re.split(r"\W+", query.lower()) if len(t) > 2]
+    if not tokens:
+        return results
+    return [r for r in results if all(
+        t in r["title"].lower() for t in tokens)]
+
+
+def dedupe_sorted(results):
+    """One row per title, keeping the best-seeded copy, seeds first."""
+    seen = {}
+    for r in results:
+        key = r["title"].lower()
+        if key not in seen or r["seeders"] > seen[key]["seeders"]:
+            seen[key] = r
+    return sorted(seen.values(), key=lambda r: -r["seeders"])
+
+
+def run_search(enabled, query):
+    """(results, errors) from every enabled source, in parallel."""
     results = []
     errors = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(enabled))) as ex:
+    if not enabled:
+        return results, errors
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, len(enabled))) as ex:
         futs = {ex.submit(ALL_SOURCES[name], query): name
                 for name in enabled}
         for fut in concurrent.futures.as_completed(futs):
@@ -552,36 +585,109 @@ def main():
                 results.extend(fut.result())
             except Exception as e:
                 errors.append(f"{futs[fut]}: {e}")
+    return results, errors
 
-    # relevance filter: every significant query word must appear in the
-    # title. Some sources (e.g. EZTV) ignore the search param and return
-    # everything; without this the list fills with unrelated torrents.
-    tokens = [t for t in re.split(r"\W+", query.lower()) if len(t) > 2]
-    if tokens:
-        results = [r for r in results if all(
-            t in r["title"].lower() for t in tokens)]
 
-    # de-dup by title, keep best-seeded
-    seen = {}
-    for r in results:
-        key = r["title"].lower()
-        if key not in seen or r["seeders"] > seen[key]["seeders"]:
-            seen[key] = r
-    results = sorted(seen.values(), key=lambda r: -r["seeders"])
+def _field(value):
+    """One safe TSV/display field: no tabs or line breaks."""
+    return re.sub(r"[\t\r\n]", " ", str(value))
 
+
+def to_rows(results):
+    """Results as dicts with clean, printable strings."""
+    rows = []
     for i, r in enumerate(results):
-        title = r["title"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
-        print("\t".join([
-            str(i), str(r["seeders"]), r["size"], r["source"],
-            title, r.get("age", "?"), r["magnet"],
-        ]))
+        rows.append({
+            "id": str(i),
+            "seeders": str(r["seeders"]),
+            "size": _field(r["size"]),
+            "source": _field(r["source"]),
+            "title": _field(r["title"]),
+            "age": _field(r.get("age", "?")),
+            # a magnet carrying an encoded tab would otherwise split the row
+            "magnet": re.sub(r"[\t\r\n]", "", str(r["magnet"])),
+        })
+    return rows
 
-    # print errors even when other sources produced results: a caller with
-    # SAIL_DEBUG=1 needs to see the broken scraper, not just a short list.
-    # Normal searches discard this stream, so it costs nothing there.
+
+def to_tsv(rows):
+    return "".join("\t".join(row[k] for k in
+                             ("id", "seeders", "size", "source", "title",
+                              "age", "magnet")) + "\n"
+                   for row in rows)
+
+
+def to_json(rows):
+    return json.dumps(rows, indent=2, ensure_ascii=False)
+
+
+def main():
+    argv = sys.argv[1:]
+
+    if argv and argv[0] == "--list-sources":
+        for name in ALL_SOURCES:
+            default = "1" if name in DEFAULT_ENABLED else "0"
+            print(f"{name}\t{SOURCE_INFO[name]}\t{default}")
+        return
+
+    if argv and argv[0] == "--enabled":
+        # single source of truth for the `sail sources` UI: the same
+        # parsing, defaults, and "empty file means none" rule a search uses
+        for name in load_enabled():
+            print(name)
+        return
+
+    as_json = False
+    if argv and argv[0] == "--json":
+        as_json = True
+        argv = argv[1:]
+
+    unknown = []
+    if argv and argv[0].startswith("--sources="):
+        wanted = argv[0].split("=", 1)[1].split(",")
+        enabled = [s for s in wanted if s in ALL_SOURCES]
+        argv = argv[1:]
+    else:
+        enabled, unknown = read_config()
+
+    if not argv or not " ".join(argv).strip():
+        print("usage: search.py [--json] [--sources=a,b,c] <query>",
+              file=sys.stderr)
+        sys.exit(1)
+    query = " ".join(argv).strip()
+
+    # a typo'd or empty config must not read as "nothing matched your query"
+    if unknown:
+        print("[sources] ignoring unknown source name(s): "
+              + ", ".join(unknown), file=sys.stderr)
+    if not enabled:
+        print("[sources] no sources enabled — run: sail sources",
+              file=sys.stderr)
+        sys.exit(3)
+
+    results, errors = run_search(enabled, query)
+    rows = to_rows(dedupe_sorted(filter_relevant(results, query)))
+
+    if as_json:
+        print(to_json(rows))
+    else:
+        sys.stdout.write(to_tsv(rows))
+
+    # errors are printed even when other sources produced results: a caller
+    # with SAIL_DEBUG=1 needs to see the broken scraper, not just a short
+    # list. bin/sail shows only the [sources] summary line otherwise.
     for e in errors:
         print(f"  [source error] {e}", file=sys.stderr)
-    if not results:
+    if errors:
+        print(f"[sources] {len(errors)} of {len(enabled)} unavailable",
+              file=sys.stderr)
+
+    # all sources failing is not "no results" — say so, and use a distinct
+    # status so the caller can print the right hint
+    if len(errors) == len(enabled):
+        sys.exit(2)
+
+    if not results and not as_json:
         print("No results found.", file=sys.stderr)
 
 

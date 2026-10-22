@@ -30,7 +30,8 @@ trap cleanup EXIT
 # strict reproduces uint8-util >=2.3 (typed-array-only arr2hex), lenient
 # reproduces <=2.2.x (accepts anything Buffer.from accepts).
 make_tree() {
-    local root="$('mktemp' -d)"
+    local root
+    root="$(mktemp -d)"
     ROOTS+=("$root")
     local wt="$root/node_modules/webtorrent"
     mkdir -p "$wt/lib" "$root/node_modules/uint8-util/dist/src"
