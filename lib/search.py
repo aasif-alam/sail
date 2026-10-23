@@ -15,8 +15,8 @@ detail page to extract the magnet (used for scraped sources like 1337x).
 Uses only the Python standard library.
 """
 
-import concurrent.futures
 import html
+import hashlib
 import json
 import os
 import queue
@@ -46,7 +46,7 @@ TRACKERS = [
 MIRRORS_1337X = ["1337x.to", "1337x.st", "x1337x.se", "1377x.to"]
 
 
-def http_get(url, timeout=6):
+def http_get(url, timeout=4):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
@@ -423,7 +423,7 @@ def search_torrentscsv(query):
 def search_torrentquest(query):
     """TorrentQuest — aggregator, scraped. Rows carry magnet + stats inline."""
     page = http_get("https://torrentquest.com/i/" + urllib.parse.quote(query)
-                    + "/", timeout=8)
+                    + "/", timeout=5)
     out = []
     for row in re.split(r"<tr", page):
         m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', row)
@@ -447,7 +447,7 @@ def search_torrentquest(query):
 def search_extratorrent(query):
     """ExtraTorrent clone (extratorrent.st) — scraped, magnets inline."""
     page = http_get("https://extratorrent.st/search/?search="
-                    + urllib.parse.quote(query), timeout=8)
+                    + urllib.parse.quote(query), timeout=5)
     out = []
     for row in re.split(r"<tr", page):
         if "btih:" not in row:
@@ -541,7 +541,7 @@ def load_enabled():
 
 def magnet_from_detail(url):
     """Fetch a scraped detail page and pull out its magnet link."""
-    page = http_get(url, timeout=8)
+    page = http_get(url, timeout=5)
     m = re.search(r'href="(magnet:\?xt=urn:btih:[^"]+)"', page)
     if not m:
         raise RuntimeError(f"no magnet found at {url}")
@@ -570,21 +570,161 @@ def dedupe_sorted(results):
     return sorted(seen.values(), key=lambda r: -r["seeders"])
 
 
+def search_timeout():
+    """Overall wall-clock budget (seconds) the whole search phase may spend.
+
+    SAIL_SEARCH_TIMEOUT overrides it; a bogus value falls back to the
+    default, and it never goes below one second so a typo'd env var can't
+    turn into "0 s budget" and drop every source instantly."""
+    try:
+        budget = float(os.environ.get("SAIL_SEARCH_TIMEOUT", "6"))
+    except ValueError:
+        budget = 6.0
+    return max(1.0, budget)
+
+
+# --------------------------------------------------------------- cache
+
+CACHE_TTL = 300.0  # seconds one (source, query) answer stays fresh
+
+
+def cache_dir():
+    """Where per-source answers are cached; created on demand.
+
+    SAIL_CACHE_DIR overrides it (tests use that for hermeticity); normally
+    it lives under the XDG cache dir, falling back to ~/.cache."""
+    base = os.environ.get("SAIL_CACHE_DIR")
+    if not base:
+        base = os.path.join(
+            os.environ.get("XDG_CACHE_HOME")
+            or os.path.expanduser("~/.cache"), "sail", "search")
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def cache_enabled():
+    """Caching is on unless asked off (SAIL_NO_CACHE=1 or a zero TTL)."""
+    return not (os.environ.get("SAIL_NO_CACHE") == "1"
+                or cache_ttl() <= 0)
+
+
+def cache_ttl():
+    try:
+        return float(os.environ.get("SAIL_CACHE_TTL", CACHE_TTL))
+    except ValueError:
+        return CACHE_TTL
+
+
+def _cache_path(source, query):
+    digest = hashlib.sha1(f"{source}\0{query}".encode("utf-8")).hexdigest()
+    return os.path.join(cache_dir(), f"{source}-{digest}.json")
+
+
+def cache_read(source, query):
+    """The cached answer for (source, query), or None on miss or expiry."""
+    if not cache_enabled():
+        return None
+    try:
+        with open(_cache_path(source, query), encoding="utf-8") as f:
+            doc = json.load(f)
+        results = doc["results"]
+        saved = float(doc["saved"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if time.time() - saved > cache_ttl():
+        return None
+    return results
+
+
+def cache_write(source, query, results):
+    """Record a successful, non-empty answer — atomically, so a concurrent
+    run never sees a half-written cache file. Failures and empty answers
+    are deliberately not cached: a source that was down or returned thin
+    must be retried, not pinned in place for the whole TTL."""
+    if not results or not cache_enabled():
+        return
+    path = _cache_path(source, query)
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"saved": time.time(), "results": results}, f)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- search
+
+
 def run_search(enabled, query):
-    """(results, errors) from every enabled source, in parallel."""
-    results = []
-    errors = []
+    """(results, errors) from every enabled source, in parallel.
+
+    Bounded by a global deadline (search_timeout). A source that still has
+    not reported when the clock runs out is dropped and reported as
+    unavailable, instead of setting the search time the way a hung socket
+    would — urllib's timeout is per socket operation, and it walks every
+    resolved address serially, so one stalled dual-stack host used to cost
+    two full timeouts and, being the slowest enabled source, set the total.
+
+    Plain daemon threads, not ThreadPoolExecutor: a pool's worker threads
+    are joined at interpreter exit even after shutdown(wait=False), so a
+    source abandoned at the deadline would keep holding up the search.py
+    process afterwards — daemon threads are simply dropped, exactly the
+    reasoning first_success applies at mirror scale.
+
+    A fresh answer for (source, query) is also written to the cache, and a
+    cached answer short-circuits the source entirely: no thread, no request.
+    A source dropped by this run's deadline can therefore still have its
+    late answer serve the next one."""
+    results, errors = [], []
     if not enabled:
         return results, errors
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, len(enabled))) as ex:
-        futs = {ex.submit(ALL_SOURCES[name], query): name
-                for name in enabled}
-        for fut in concurrent.futures.as_completed(futs):
+    budget = search_timeout()
+    deadline = time.monotonic() + budget
+    pending = set(enabled)
+    q = queue.Queue()
+
+    def run(name, fn):
+        try:
+            out = fn(query) or []
+            # cache before posting: the moment the queue releases this
+            # answer, a follow-on search may already be reading the cache
             try:
-                results.extend(fut.result())
-            except Exception as e:
-                errors.append(f"{futs[fut]}: {e}")
+                cache_write(name, query, out)
+            except Exception:
+                pass  # a cache problem must never fail the search
+            q.put((name, out, None))
+        except Exception as e:
+            q.put((name, None, f"{name}: {e}"))
+
+    for name in enabled:
+        cached = cache_read(name, query)
+        if cached is not None:
+            results.extend(cached)
+            pending.discard(name)
+            continue
+        threading.Thread(target=run, args=(name, ALL_SOURCES[name]),
+                         daemon=True).start()
+
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            name, out, err = q.get(timeout=remaining)
+        except queue.Empty:
+            break
+        pending.discard(name)
+        if err:
+            errors.append(err)
+        else:
+            results.extend(out)
+
+    for name in sorted(pending):
+        errors.append(f"{name}: exceeded the {budget:g}s search deadline")
     return results, errors
 
 

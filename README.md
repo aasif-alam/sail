@@ -36,6 +36,15 @@ failures) after a search that comes back thin, and why a subtitle already
 in the torrent (if any) failed to fetch — normally both are discarded so
 a broken scraper or a missing subtitle doesn't clutter the output.
 
+A search races every enabled source in parallel and is bounded overall by
+`SAIL_SEARCH_TIMEOUT` (default 6 seconds): a source that has not answered
+by then is dropped for that search and reported unavailable, instead of
+being allowed to define the search time. Repeating a query within
+`SAIL_CACHE_TTL` (default 5 minutes) reuses the previous per-source
+answers, so a near-instant rerun costs no traffic; `SAIL_NO_CACHE=1`
+turns that off. Only successful, non-empty source answers are cached — a
+source that failed or came back empty is retried next time.
+
 When streaming a torrent with more than one video file (season packs,
 movies with extras), sail shows a picker so you choose exactly which one
 plays — only that file is downloaded, never the whole torrent. A single
@@ -166,6 +175,10 @@ menu — CLI apps never see that keystroke — so the binding is `ctrl-x`.
 | `SAIL_NOTIFY` | `1` | `0` disables macOS notifications |
 | `SAIL_META_WAIT` | `300` | seconds per metadata attempt |
 | `SAIL_STALL_TIMEOUT` | `300` | seconds without data before giving up; `0` disables |
+| `SAIL_SEARCH_TIMEOUT` | `6` | overall seconds one search may spend; a source still running when it expires is dropped and reported unavailable |
+| `SAIL_NO_CACHE` | `0` | `1` disables the search-result cache |
+| `SAIL_CACHE_TTL` | `300` | seconds a per-source search answer stays cached; `0` disables |
+| `SAIL_CACHE_DIR` | `~/.cache/sail/search` | search-result cache location |
 | `SAIL_WTMOD` | discovered | path to the webtorrent module (rarely needed) |
 | `SAIL_UTF8_LOCALE` | `en_US.UTF-8` | locale used for multibyte-safe widths |
 

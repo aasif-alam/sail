@@ -3,7 +3,9 @@ the real internet."""
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -264,6 +266,8 @@ class SourceErrorOutputTest(unittest.TestCase):
 
         with mock.patch.object(search, "ALL_SOURCES",
                                {"boom": boom, "good": good}), \
+             tempfile.TemporaryDirectory() as cd, \
+             mock.patch.dict(os.environ, {"SAIL_CACHE_DIR": cd}), \
              mock.patch.object(sys, "argv",
                                ["search.py", "--sources=boom,good", "x"]), \
              mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out, \
@@ -344,6 +348,8 @@ class JsonModeTest(unittest.TestCase):
             return [_row()]
 
         with mock.patch.object(search, "ALL_SOURCES", {"good": good}), \
+             tempfile.TemporaryDirectory() as cd, \
+             mock.patch.dict(os.environ, {"SAIL_CACHE_DIR": cd}), \
              mock.patch.object(sys, "argv",
                                ["search.py", "--json", "--sources=good", "x"]), \
              mock.patch.object(sys, "stdout", new_callable=io.StringIO) as out, \
@@ -449,6 +455,114 @@ class SourceInfoConsistencyTest(unittest.TestCase):
     def test_default_enabled_are_all_registered(self):
         for name in search.DEFAULT_ENABLED:
             self.assertIn(name, search.ALL_SOURCES)
+
+
+class RunSearchDeadlineTest(unittest.TestCase):
+    """run_search must bound the whole search phase: a source hanging past
+    the deadline is dropped (and reported unavailable) instead of defining
+    the search time, and its still-running thread must not hold up the
+    caller afterwards."""
+
+    def setUp(self):
+        self.cache_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache_dir, True)
+        self.env = {"SAIL_SEARCH_TIMEOUT": "0.5", "SAIL_CACHE_DIR": self.cache_dir}
+
+    def test_slow_source_dropped_fast_source_kept(self):
+        def slow(_query):
+            time.sleep(3)
+            return [_row("Slow")]
+
+        def fast(_query):
+            return [_row("Fast")]
+
+        with mock.patch.object(search, "ALL_SOURCES",
+                               {"slow": slow, "fast": fast}), \
+             mock.patch.dict(os.environ, self.env):
+            start = time.monotonic()
+            results, errors = search.run_search(["slow", "fast"], "x")
+            elapsed = time.monotonic() - start
+        self.assertEqual([r["title"] for r in results], ["Fast"])
+        self.assertEqual(len(errors), 1)
+        self.assertIn("slow", errors[0])
+        self.assertIn("deadline", errors[0])
+        # fast answers within the budget; the dropped source must not stretch
+        # the wait anything like its full sleep
+        self.assertLess(elapsed, 3.0)
+
+    def test_all_sources_dropped_exits_2(self):
+        import io
+
+        def slow(_query):
+            time.sleep(3)
+            return [_row("Slow")]
+
+        with mock.patch.object(search, "ALL_SOURCES", {"slow": slow}), \
+             mock.patch.dict(os.environ, self.env), \
+             mock.patch.object(sys, "argv",
+                               ["search.py", "--sources=slow", "x"]), \
+             mock.patch.object(sys, "stderr",
+                               new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as cm:
+                search.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("1 of 1 unavailable", err.getvalue())
+        self.assertIn("deadline", err.getvalue())
+
+
+class RunSearchCacheTest(unittest.TestCase):
+    """The per-(source, query) cache must make repeat searches instant,
+    without ever pinning a failure or an empty answer in place."""
+
+    def setUp(self):
+        self.cache_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.cache_dir, True)
+
+    def run_twice(self, result_of_call, extra_env=()):
+        """Run the same (source, query) twice; count the source's calls."""
+        calls = []
+
+        def fake(_query):
+            calls.append(1)
+            return result_of_call()
+
+        env = {"SAIL_CACHE_DIR": self.cache_dir}
+        env.update(dict(extra_env))
+        with mock.patch.object(search, "ALL_SOURCES", {"fake": fake}), \
+             mock.patch.dict(os.environ, env):
+            first = search.run_search(["fake"], "q")
+            second = search.run_search(["fake"], "q")
+        return calls, first, second
+
+    def test_repeat_search_is_served_from_cache(self):
+        calls, (out1, _), (out2, _) = self.run_twice(lambda: [_row("Cached")])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([r["title"] for r in out1], ["Cached"])
+        self.assertEqual([r["title"] for r in out2], ["Cached"])
+
+    def test_failed_source_is_not_cached(self):
+        def boom():
+            raise RuntimeError("down")
+
+        calls, (out1, err1), (out2, err2) = self.run_twice(boom)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out1, [])
+        self.assertEqual(out2, [])
+        self.assertTrue(err1 and err2)
+
+    def test_empty_results_are_not_cached(self):
+        calls, _, _ = self.run_twice(lambda: [])
+        self.assertEqual(len(calls), 2)
+
+    def test_sail_no_cache_disables_caching(self):
+        calls, _, _ = self.run_twice(
+            lambda: [_row("Fresh")], {"SAIL_NO_CACHE": "1"})
+        self.assertEqual(len(calls), 2)
+
+    def test_zero_ttl_disables_caching(self):
+        calls, _, _ = self.run_twice(
+            lambda: [_row("Fresh")], {"SAIL_CACHE_TTL": "0"})
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":
